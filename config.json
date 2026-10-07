@@ -1,12 +1,9 @@
 {
   "log": {
-    "loglevel": "warning"
+    "loglevel": "debug"
   },
   "dns": {
-    "servers": [
-      "77.88.8.8",
-      "1.1.1.1"
-    ],
+    "servers": ["8.8.8.8", "1.1.1.1"],
     "queryStrategy": "UseIPv4"
   },
   "inbounds": [
@@ -14,8 +11,9 @@
       "listen": "127.0.0.1",
       "port": 10809,
       "protocol": "http",
-      "settings": {
-        "allowTransparent": false
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
       },
       "tag": "http-in"
     }
@@ -46,6 +44,9 @@
           "fingerprint": "firefox",
           "publicKey": "yo4lSUn_5i7HCFBG6rszy8LZWCV_WuYuV_312M8tihk",
           "shortId": "b006669e43ae5c1f"
+        },
+        "sockopt": {
+          "domainStrategy": "UseIPv4"
         }
       },
       "tag": "proxy"
