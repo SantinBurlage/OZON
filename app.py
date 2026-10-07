@@ -39,8 +39,6 @@ PROXY_PASS = "auBcMS"
 
 # ==========================================
 # 🎨 ПРЕМИУМ ЭМОДЗИ (CUSTOM EMOJI)
-# Чтобы узнать ID нужного смайлика, просто отправь его боту в чат!
-# Затем скопируй цифры и замени их здесь:
 # ==========================================
 E_OK = '<tg-emoji emoji-id="5422894178558352613">🟢</tg-emoji>'
 E_NO = '<tg-emoji emoji-id="5422965610055276326">🔴</tg-emoji>'
@@ -78,6 +76,7 @@ browser_lock = asyncio.Semaphore(1)
 START_TIME = time.time()
 TOTAL_CHECKS_COUNT = 0
 user_tracked_items: Dict[int, List[dict]] = {}
+monitoring_tasks: Dict[int, asyncio.Task] = {} # ВОТ ЭТА СТРОКА ВЕРНУЛАСЬ НА МЕСТО
 
 # --- Работа с Базой Данных (JSON) ---
 def load_db():
