@@ -38,8 +38,9 @@ PROXY_USER = "8BNMZ4"
 PROXY_PASS = "auBcMS"           
 
 # ==========================================
-# 🎨 ПРЕМИУМ ЭМОДЗИ (CUSTOM EMOJI)
+# 🎨 ПРЕМИУМ ЭМОДЗИ (РАСШИРЕННЫЙ ДИЗАЙН)
 # ==========================================
+E_LOGO = '<tg-emoji emoji-id="5332599723058203004">🔥</tg-emoji>'
 E_OK = '<tg-emoji emoji-id="5422894178558352613">🟢</tg-emoji>'
 E_NO = '<tg-emoji emoji-id="5422965610055276326">🔴</tg-emoji>'
 E_WARN = '<tg-emoji emoji-id="5422839254332029514">⚠️</tg-emoji>'
@@ -47,17 +48,18 @@ E_BOX = '<tg-emoji emoji-id="5422904589257083437">📦</tg-emoji>'
 E_MONEY = '<tg-emoji emoji-id="5423164916368481358">💰</tg-emoji>'
 E_SALE = '<tg-emoji emoji-id="5422839254332029514">📉</tg-emoji>'
 E_LINK = '<tg-emoji emoji-id="5422839254332029514">🔗</tg-emoji>'
-E_STATS = '<tg-emoji emoji-id="5422839254332029514">📊</tg-emoji>'
-E_LIST = '<tg-emoji emoji-id="5422839254332029514">📋</tg-emoji>'
-E_TRASH = '<tg-emoji emoji-id="5422839254332029514">🗑</tg-emoji>'
-E_SEARCH = '<tg-emoji emoji-id="5422839254332029514">🔍</tg-emoji>'
-E_REFRESH = '<tg-emoji emoji-id="5422839254332029514">🔄</tg-emoji>'
-E_SHIELD = '<tg-emoji emoji-id="5422839254332029514">🛡</tg-emoji>'
-E_CLOCK = '<tg-emoji emoji-id="5422839254332029514">⏱</tg-emoji>'
-E_GLOBE = '<tg-emoji emoji-id="5422839254332029514">🌐</tg-emoji>'
-E_CHECK = '<tg-emoji emoji-id="5422839254332029514">✅</tg-emoji>'
-E_TARGET = '<tg-emoji emoji-id="5422839254332029514">🎯</tg-emoji>'
-E_INFO = '<tg-emoji emoji-id="5422839254332029514">ℹ️</tg-emoji>'
+E_STATS = '<tg-emoji emoji-id="5423165215585842880">📈</tg-emoji>'
+E_LIST = '<tg-emoji emoji-id="5422778401955986872">📋</tg-emoji>'
+E_TRASH = '<tg-emoji emoji-id="5423048924611130099">🗑</tg-emoji>'
+E_REFRESH = '<tg-emoji emoji-id="5422791404097127117">🔄</tg-emoji>'
+E_SHIELD = '<tg-emoji emoji-id="5422728954752538114">🛡</tg-emoji>'
+E_CLOCK = '<tg-emoji emoji-id="5422765378772036496">⏱</tg-emoji>'
+E_GLOBE = '<tg-emoji emoji-id="5422879555462100411">🌐</tg-emoji>'
+E_CHECK = '<tg-emoji emoji-id="5422915830843232049">✅</tg-emoji>'
+E_TARGET = '<tg-emoji emoji-id="5423067824962955519">🎯</tg-emoji>'
+E_INFO = '<tg-emoji emoji-id="5422731802999557404">ℹ️</tg-emoji>'
+E_WAVE = '<tg-emoji emoji-id="5423192429677273398">👋</tg-emoji>'
+E_SPARK = '<tg-emoji emoji-id="5332599723058203004">✨</tg-emoji>'
 # ==========================================
 
 USER_AGENT = (
@@ -76,9 +78,8 @@ browser_lock = asyncio.Semaphore(1)
 START_TIME = time.time()
 TOTAL_CHECKS_COUNT = 0
 user_tracked_items: Dict[int, List[dict]] = {}
-monitoring_tasks: Dict[int, asyncio.Task] = {} # ВОТ ЭТА СТРОКА ВЕРНУЛАСЬ НА МЕСТО
+monitoring_tasks: Dict[int, asyncio.Task] = {}
 
-# --- Работа с Базой Данных (JSON) ---
 def load_db():
     global user_tracked_items
     if os.path.exists(DB_FILE):
@@ -101,7 +102,6 @@ def extract_price(price_str: str) -> int:
     digits = re.sub(r"\D", "", price_str)
     return int(digits) if digits else 0
 
-# --- Подключение Playwright ---
 async def get_browser_context() -> BrowserContext:
     global browser, context
     if browser is None or not browser.is_connected():
@@ -141,7 +141,6 @@ async def get_browser_context() -> BrowserContext:
         """)
     return context
 
-# --- Парсинг страницы ---
 async def inspect_ozon_page(url: str) -> Tuple[Optional[bool], str, str, str, Optional[bytes], Optional[str]]:
     global TOTAL_CHECKS_COUNT
     TOTAL_CHECKS_COUNT += 1
@@ -201,7 +200,6 @@ def make_product_keyboard(url: str, item_id: int) -> InlineKeyboardMarkup:
         ]
     ])
 
-# --- Фоновый мониторинг ---
 async def monitoring_worker(chat_id: int):
     while True:
         try:
@@ -231,7 +229,7 @@ async def monitoring_worker(chat_id: int):
                 
                 if is_avail is True and old_status is not True:
                     caption = (
-                        f"{E_OK} <b>ТОВАР В НАЛИЧИИ!</b> {E_OK}\n\n"
+                        f"{E_LOGO} <b>ТОВАР В НАЛИЧИИ!</b> {E_LOGO}\n\n"
                         f"{E_BOX} <b>{name}</b>\n"
                         f"{E_MONEY} Цена: <b>{price}</b>\n"
                         f"{E_STATS} Остаток: {stock}"
@@ -262,10 +260,11 @@ async def monitoring_worker(chat_id: int):
             logging.error(f"Worker err: {exc}")
         await asyncio.sleep(CHECK_INTERVAL_SECONDS + random.uniform(1.0, 10.0))
 
-# --- Команды ---
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     chat_id = message.chat.id
+    username = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
+    
     if chat_id not in user_tracked_items:
         user_tracked_items[chat_id] = []
         save_db()
@@ -278,10 +277,10 @@ async def cmd_start(message: Message):
     ])
 
     await message.answer(
-        f"{E_OK} <b>Ozon Ultimate Edition</b>\n"
+        f"{E_LOGO} <b>OZON TRACKER</b> {E_SPARK}\n"
+        f"{E_WAVE} Привет, <b>{username}</b>!\n"
         f"{E_SHIELD} Прокси подключен: <code>{PROXY_IP}</code>\n\n"
-        f"Отправь ссылку на товар, чтобы начать отслеживание.\n"
-        f"<i>P.S. Чтобы узнать ID любого премиум-эмодзи, просто отправь его мне!</i>",
+        f"Отправь ссылку на товар, чтобы начать отслеживание.",
         parse_mode="HTML",
         reply_markup=kb
     )
@@ -372,22 +371,6 @@ async def handle_url(message: Message):
     else:
         await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=kb)
 
-# --- Шпион для получения ID премиум-эмодзи ---
-@dp.message(F.text)
-async def catch_premium_emoji(message: Message):
-    if message.entities:
-        for ent in message.entities:
-            if ent.type == "custom_emoji":
-                await message.answer(
-                    f"🆔 <b>ID этого смайлика:</b> <code>{ent.custom_emoji_id}</code>\n\n"
-                    f"Скопируй эти цифры и вставь их в блок настроек <b>app.py</b>, "
-                    f"оставив сам тег <code>&lt;tg-emoji&gt;</code> нетронутым.",
-                    parse_mode="HTML"
-                )
-                return
-    await message.answer(f"{E_INFO} Отправь мне ссылку на Ozon или любой премиум-смайлик, чтобы я выдал его ID.")
-
-# --- Обработчики кнопок ---
 @dp.callback_query(F.data.startswith("check_now:"))
 async def callback_check_now(callback: CallbackQuery):
     item_id = int(callback.data.split(":")[1])
