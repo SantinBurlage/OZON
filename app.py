@@ -21,14 +21,16 @@ from aiogram.types import (
     InlineKeyboardButton,
     CallbackQuery,
 )
-from playwright.async_api import async_playwright, Browser, BrowserContext
+from playwright.async_api import async_playwright, BrowserContext
+from playwright_stealth import stealth_async
 
 # ==========================================
 # ⚙️ НАСТРОЙКИ БОТА И ПРОКСИ
 # ==========================================
 BOT_TOKEN = "8930660922:AAG-e6Kn4hGA5UWLLmyk9ttLszuxcRvF0sk"
-CHECK_INTERVAL_SECONDS = 30
+CHECK_INTERVAL_SECONDS = 600  # 10 минут — идеальный интервал для тишины от капч
 DB_FILE = "database.json"
+USER_DATA_DIR = "browser_profile"
 
 # Твой прокси от Proxy6
 PROXY_TYPE = "http"       
@@ -36,43 +38,15 @@ PROXY_IP = "45.81.78.52"
 PROXY_PORT = "8000"           
 PROXY_USER = "8BNMZ4"           
 PROXY_PASS = "auBcMS"           
-
-# ==========================================
-# 🎨 ПРЕМИУМ ЭМОДЗИ (РАСШИРЕННЫЙ ДИЗАЙН)
-# ==========================================
-E_LOGO = '<tg-emoji emoji-id="5332599723058203004">🔥</tg-emoji>'
-E_OK = '<tg-emoji emoji-id="5422894178558352613">🟢</tg-emoji>'
-E_NO = '<tg-emoji emoji-id="5422965610055276326">🔴</tg-emoji>'
-E_WARN = '<tg-emoji emoji-id="5422839254332029514">⚠️</tg-emoji>'
-E_BOX = '<tg-emoji emoji-id="5422904589257083437">📦</tg-emoji>'
-E_MONEY = '<tg-emoji emoji-id="5423164916368481358">💰</tg-emoji>'
-E_SALE = '<tg-emoji emoji-id="5422839254332029514">📉</tg-emoji>'
-E_LINK = '<tg-emoji emoji-id="5422839254332029514">🔗</tg-emoji>'
-E_STATS = '<tg-emoji emoji-id="5423165215585842880">📈</tg-emoji>'
-E_LIST = '<tg-emoji emoji-id="5422778401955986872">📋</tg-emoji>'
-E_TRASH = '<tg-emoji emoji-id="5423048924611130099">🗑</tg-emoji>'
-E_REFRESH = '<tg-emoji emoji-id="5422791404097127117">🔄</tg-emoji>'
-E_SHIELD = '<tg-emoji emoji-id="5422728954752538114">🛡</tg-emoji>'
-E_CLOCK = '<tg-emoji emoji-id="5422765378772036496">⏱</tg-emoji>'
-E_GLOBE = '<tg-emoji emoji-id="5422879555462100411">🌐</tg-emoji>'
-E_CHECK = '<tg-emoji emoji-id="5422915830843232049">✅</tg-emoji>'
-E_TARGET = '<tg-emoji emoji-id="5423067824962955519">🎯</tg-emoji>'
-E_INFO = '<tg-emoji emoji-id="5422731802999557404">ℹ️</tg-emoji>'
-E_WAVE = '<tg-emoji emoji-id="5423192429677273398">👋</tg-emoji>'
-E_SPARK = '<tg-emoji emoji-id="5332599723058203004">✨</tg-emoji>'
 # ==========================================
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+# Мобильный User-Agent (на мобильной версии Ozon защиты почти нет)
+MOBILE_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-browser: Optional[Browser] = None
-context: Optional[BrowserContext] = None
+persistent_context: Optional[BrowserContext] = None
 browser_lock = asyncio.Semaphore(1)
 
 START_TIME = time.time()
@@ -102,9 +76,14 @@ def extract_price(price_str: str) -> int:
     digits = re.sub(r"\D", "", price_str)
     return int(digits) if digits else 0
 
-async def get_browser_context() -> BrowserContext:
-    global browser, context
-    if browser is None or not browser.is_connected():
+def convert_to_mobile_url(url: str) -> str:
+    """Превращает десктопную ссылку Ozon в мобильную для обхода защиты"""
+    url = url.replace("www.ozon.ru", "m.ozon.ru").replace("ozon.ru", "m.ozon.ru")
+    return url
+
+async def get_persistent_context() -> BrowserContext:
+    global persistent_context
+    if persistent_context is None:
         p = await async_playwright().start()
         
         proxy_conf = {
@@ -113,9 +92,19 @@ async def get_browser_context() -> BrowserContext:
             "password": PROXY_PASS
         }
         
-        browser = await p.chromium.launch(
+        os.makedirs(USER_DATA_DIR, exist_ok=True)
+        
+        persistent_context = await p.chromium.launch_persistent_context(
+            user_data_dir=USER_DATA_DIR,
             headless=True,
             proxy=proxy_conf,
+            user_agent=MOBILE_USER_AGENT,
+            viewport={"width": 390, "height": 844},  # Размер экрана iPhone 12/13/14
+            device_scale_factor=3,
+            is_mobile=True,
+            has_touch=True,
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -123,39 +112,34 @@ async def get_browser_context() -> BrowserContext:
                 "--disable-infobars",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--window-size=1920,1080",
+                "--lang=ru-RU,ru",
             ],
         )
-
-    if context is None:
-        context = await browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1920, "height": 1080},
-            device_scale_factor=1,
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-        )
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = { runtime: {}, app: {} };
-        """)
-    return context
+    return persistent_context
 
 async def inspect_ozon_page(url: str) -> Tuple[Optional[bool], str, str, str, Optional[bytes], Optional[str]]:
     global TOTAL_CHECKS_COUNT
     TOTAL_CHECKS_COUNT += 1
 
+    mobile_url = convert_to_mobile_url(url)
+
     async with browser_lock:
-        ctx = await get_browser_context()
+        ctx = await get_persistent_context()
         page = await ctx.new_page()
+        
+        await stealth_async(page)
+        
         try:
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=40000)
-            await asyncio.sleep(random.uniform(1.0, 2.5))
-            await page.mouse.wheel(0, random.randint(300, 700))
-            await asyncio.sleep(random.uniform(1.5, 3.0))
+            response = await page.goto(mobile_url, wait_until="domcontentloaded", timeout=45000)
+            
+            # Легкие мобильные движения
+            await asyncio.sleep(random.uniform(2.0, 3.5))
+            await page.mouse.wheel(0, random.randint(300, 600))
+            await asyncio.sleep(random.uniform(1.5, 2.5))
+
             content = await page.content()
 
-            if re.search(r"проверка безопасности|captcha|access denied", content, re.IGNORECASE):
+            if re.search(r"проверка безопасности|captcha|access denied|cloudflare", content, re.IGNORECASE):
                 screen = await page.screenshot(type="jpeg", quality=75)
                 return None, "Неизвестно", "—", "Капча", screen, "Блокировка / Капча Ozon"
 
@@ -163,14 +147,18 @@ async def inspect_ozon_page(url: str) -> Tuple[Optional[bool], str, str, str, Op
                 screen = await page.screenshot(type="jpeg", quality=75)
                 return None, "Неизвестно", "—", "Сбой HTTP", screen, f"Код ответа {response.status}"
 
-            title_match = re.search(r"<h1[^>]*>([^<]+)</h1>", content, re.IGNORECASE)
+            # Парсинг названия для мобильной версии
+            title_match = re.search(r"<span[^>]*class=\"[^\"]*title[^\"]*\"[^>]*>([^<]+)</span>", content, re.IGNORECASE)
+            if not title_match:
+                title_match = re.search(r"<h1[^>]*>([^<]+)</h1>", content, re.IGNORECASE)
             item_name = title_match.group(1).strip() if title_match else "Товар Ozon"
 
+            # Парсинг цены
             price_match = re.search(r"([\d\s ]+)\s*₽", content)
             price_text = f"{price_match.group(1).strip()} ₽" if price_match else "Не определена"
 
             is_out_of_stock = bool(re.search(r"товар закончился|узнать о поступлении|нет в наличии", content, re.IGNORECASE))
-            has_buy_button = bool(re.search(r"в корзину|купить в 1 клик|>купить<", content, re.IGNORECASE))
+            has_buy_button = bool(re.search(r"в корзину|купить в 1 клик|добавить в корзину", content, re.IGNORECASE))
 
             stock_limit_match = re.search(r"осталось\s+(\d+)\s*шт", content, re.IGNORECASE)
             stock_info = f"{stock_limit_match.group(1)} шт." if stock_limit_match else "Достаточно"
@@ -218,7 +206,7 @@ async def monitoring_worker(chat_id: int):
                 if err is not None:
                     if item.get("last_error") != err:
                         item["last_error"] = err
-                        caption = f"{E_WARN} <b>Сбой проверки:</b>\n{E_BOX} {name}\n{E_WARN} <code>{err}</code>"
+                        caption = f"⚠️ <b>Сбой проверки:</b>\n📦 {name}\n⚠️ <code>{err}</code>"
                         kb = make_product_keyboard(item["url"], item["id"])
                         if screen:
                             await bot.send_photo(chat_id, BufferedInputFile(screen, filename="err.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
@@ -229,10 +217,10 @@ async def monitoring_worker(chat_id: int):
                 
                 if is_avail is True and old_status is not True:
                     caption = (
-                        f"{E_LOGO} <b>ТОВАР В НАЛИЧИИ!</b> {E_LOGO}\n\n"
-                        f"{E_BOX} <b>{name}</b>\n"
-                        f"{E_MONEY} Цена: <b>{price}</b>\n"
-                        f"{E_STATS} Остаток: {stock}"
+                        f"🔥 <b>ТОВАР В НАЛИЧИИ!</b> 🔥\n\n"
+                        f"📦 <b>{name}</b>\n"
+                        f"💰 Цена: <b>{price}</b>\n"
+                        f"📊 Остаток: {stock}"
                     )
                     if screen:
                         await bot.send_photo(chat_id, BufferedInputFile(screen, filename="in.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
@@ -246,19 +234,19 @@ async def monitoring_worker(chat_id: int):
                     if new_p_val < old_p_val and new_p_val > 0:
                         diff = old_p_val - new_p_val
                         caption = (
-                            f"{E_SALE} <b>СНИЖЕНИЕ ЦЕНЫ!</b>\n\n"
-                            f"{E_BOX} <b>{name}</b>\n"
-                            f"{E_MONEY} Было: {old_price} ➔ <b>Стало: {price}</b>\n"
-                            f"{E_SALE} <b>Выгода: {diff} ₽</b>"
+                            f"📉 <b>СНИЖЕНИЕ ЦЕНЫ!</b>\n\n"
+                            f"📦 <b>{name}</b>\n"
+                            f"💰 Было: {old_price} ➔ <b>Стало: {price}</b>\n"
+                            f"📉 <b>Выгода: {diff} ₽</b>"
                         )
                         await bot.send_photo(chat_id, BufferedInputFile(screen, filename="sale.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
 
-                await asyncio.sleep(random.uniform(3.0, 5.0))
+                await asyncio.sleep(random.uniform(4.0, 8.0))
         except asyncio.CancelledError:
             break
         except Exception as exc:
             logging.error(f"Worker err: {exc}")
-        await asyncio.sleep(CHECK_INTERVAL_SECONDS + random.uniform(1.0, 10.0))
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS + random.uniform(10.0, 30.0))
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -277,26 +265,27 @@ async def cmd_start(message: Message):
     ])
 
     await message.answer(
-        f"{E_LOGO} <b>OZON TRACKER</b> {E_SPARK}\n"
-        f"{E_WAVE} Привет, <b>{username}</b>!\n"
-        f"{E_SHIELD} Прокси подключен: <code>{PROXY_IP}</code>\n\n"
-        f"Отправь ссылку на товар, чтобы начать отслеживание.",
+        f"🔥 <b>OZON TRACKER</b> ✨\n"
+        f"👋 Привет, <b>{username}</b>!\n"
+        f"🛡 Прокси подключен: <code>{PROXY_IP}</code>\n\n"
+        f"Мобильный стелс-режим активен (обход защиты в 10 раз мощнее).",
         parse_mode="HTML",
         reply_markup=kb
     )
 
 @dp.message(Command("ip"))
 async def cmd_ip(message: Message):
-    wait_msg = await message.answer(f"{E_REFRESH} Запрашиваю сетевой IP...")
-    ctx = await get_browser_context()
+    wait_msg = await message.answer("🔄 Запрашиваю сетевой IP...")
+    ctx = await get_persistent_context()
     page = await ctx.new_page()
+    await stealth_async(page)
     try:
         await page.goto("https://api.ipify.org?format=json", wait_until="commit", timeout=25000)
         await asyncio.sleep(1)
         ip_data = await page.inner_text("body")
-        await wait_msg.edit_text(f"{E_GLOBE} <b>Выходной IP:</b>\n<code>{ip_data}</code>", parse_mode="HTML")
+        await wait_msg.edit_text(f"🌐 <b>Выходной IP:</b>\n<code>{ip_data}</code>", parse_mode="HTML")
     except Exception as exc:
-        await wait_msg.edit_text(f"{E_NO} <b>Ошибка:</b> {html.escape(str(exc))}", parse_mode="HTML")
+        await wait_msg.edit_text(f"🔴 <b>Ошибка:</b> {html.escape(str(exc))}", parse_mode="HTML")
     finally:
         await page.close()
 
@@ -305,16 +294,16 @@ async def cmd_list(message: Message):
     chat_id = message.chat.id
     items = user_tracked_items.get(chat_id, [])
     if not items:
-        await message.answer(f"{E_BOX} Ваш список пуст. Отправьте ссылку!")
+        await message.answer("📦 Ваш список пуст. Отправьте ссылку!")
         return
 
-    text = f"{E_LIST} <b>Ваши товары:</b>\n\n"
+    text = "📋 <b>Ваши товары:</b>\n\n"
     for idx, item in enumerate(items, 1):
         st = item.get("status")
-        icon = E_OK if st is True else (E_NO if st is False else "⚪")
+        icon = "🟢" if st is True else ("🔴" if st is False else "⚪")
         price = item.get("price", "—")
         text += f"{idx}. {icon} <b>{item.get('name', 'Загрузка...')}</b>\n"
-        text += f"{E_MONEY} Цена: {price} | {E_LINK} <a href='{item['url']}'>Ссылка</a>\n\n"
+        text += f"💰 Цена: {price} | 🔗 <a href='{item['url']}'>Ссылка</a>\n\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Сканировать все сейчас", callback_data="check_all_btn")],
@@ -331,7 +320,7 @@ async def handle_url(message: Message):
         user_tracked_items[chat_id] = []
 
     if any(item["url"] == url for item in user_tracked_items[chat_id]):
-        await message.answer(f"{E_INFO} Этот товар уже есть в базе.")
+        await message.answer("ℹ️ Этот товар уже есть в базе.")
         return
 
     item_id = int(time.time() * 1000) % 1000000
@@ -345,7 +334,7 @@ async def handle_url(message: Message):
     if chat_id not in monitoring_tasks or monitoring_tasks[chat_id].done():
         monitoring_tasks[chat_id] = asyncio.create_task(monitoring_worker(chat_id))
 
-    wait_msg = await message.answer(f"{E_TARGET} <b>Добавлено!</b> Делаю первый снимок...")
+    wait_msg = await message.answer("🎯 <b>Добавлено!</b> Загружаю через мобильный шлюз...")
     
     is_avail, name, price, stock, screen, err = await inspect_ozon_page(url)
     new_item["name"] = name
@@ -354,13 +343,13 @@ async def handle_url(message: Message):
     new_item["stock"] = stock
     save_db()
 
-    status_str = f"{E_WARN} Ошибка ({err})" if err else (f"{E_OK} В наличии" if is_avail else f"{E_NO} Закончился")
+    status_str = f"⚠️ Ошибка ({err})" if err else ("🟢 В наличии" if is_avail else "🔴 Закончился")
     caption = (
-        f"{E_CHECK} <b>Успешно добавлено</b>\n\n"
-        f"{E_BOX} <b>{name}</b>\n"
+        f"✅ <b>Успешно добавлено</b>\n\n"
+        f"📦 <b>{name}</b>\n"
         f"Статус: <b>{status_str}</b>\n"
-        f"{E_MONEY} Цена: <b>{price}</b>\n"
-        f"{E_STATS} Остаток: <b>{stock}</b>"
+        f"💰 Цена: <b>{price}</b>\n"
+        f"📊 Остаток: <b>{stock}</b>"
     )
     kb = make_product_keyboard(url, item_id)
     try: await wait_msg.delete()
@@ -387,11 +376,11 @@ async def callback_check_now(callback: CallbackQuery):
     target["name"], target["price"], target["status"], target["stock"] = name, price, is_avail, stock
     save_db()
 
-    status_str = f"{E_WARN} Ошибка ({err})" if err else (f"{E_OK} В наличии" if is_avail else f"{E_NO} Нет")
+    status_str = f"⚠️ Ошибка ({err})" if err else ("🟢 В наличии" if is_avail else "🔴 Нет")
     caption = (
-        f"{E_REFRESH} <b>Обновлено:</b>\n"
-        f"{E_BOX} <b>{name}</b>\n"
-        f"Статус: {status_str} | {E_MONEY} {price} | {E_STATS} {stock}"
+        f"🔄 <b>Обновлено:</b>\n"
+        f"📦 <b>{name}</b>\n"
+        f"Статус: {status_str} | 💰 {price} | 📊 {stock}"
     )
     kb = make_product_keyboard(target["url"], item_id)
     if screen:
@@ -419,11 +408,11 @@ async def callback_stats(callback: CallbackQuery):
     uptime_str = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
     tracked_count = len(user_tracked_items.get(callback.message.chat.id, []))
     text = (
-        f"{E_STATS} <b>Панель управления:</b>\n\n"
-        f"{E_CLOCK} Аптайм: <code>{uptime_str}</code>\n"
-        f"{E_BOX} Ваших товаров: <code>{tracked_count}</code>\n"
-        f"{E_REFRESH} Всего проверок: <code>{TOTAL_CHECKS_COUNT}</code>\n"
-        f"{E_SHIELD} IP Прокси: <code>{PROXY_IP}</code>"
+        f"📊 <b>Панель управления:</b>\n\n"
+        f"⏱ Аптайм: <code>{uptime_str}</code>\n"
+        f"📦 Ваших товаров: <code>{tracked_count}</code>\n"
+        f"🔄 Всего проверок: <code>{TOTAL_CHECKS_COUNT}</code>\n"
+        f"🛡 IP Прокси: <code>{PROXY_IP}</code>"
     )
     await callback.answer()
     await callback.message.answer(text, parse_mode="HTML")
@@ -433,7 +422,7 @@ async def callback_clear_all(callback: CallbackQuery):
     user_tracked_items[callback.message.chat.id] = []
     save_db()
     await callback.answer("Очищено", show_alert=True)
-    await callback.message.edit_text(f"{E_TRASH} Список пуст.")
+    await callback.message.edit_text("🗑️ Список пуст.")
 
 @dp.callback_query(F.data == "check_all_btn")
 async def callback_check_all(callback: CallbackQuery):
