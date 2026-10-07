@@ -45,8 +45,7 @@
           "serverName": "cdn.okko.tv",
           "fingerprint": "firefox",
           "publicKey": "yo4lSUn_5i7HCFBG6rszy8LZWCV_WuYuV_312M8tihk",
-          "shortId": "b006669e43ae5c1f",
-          "spiderX": "/"
+          "shortId": "b006669e43ae5c1f"
         }
       },
       "tag": "proxy"
