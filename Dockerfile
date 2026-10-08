@@ -1,13 +1,12 @@
-# Используем официальный образ с уже установленными браузерами Playwright
-FROM mcr.microsoft.com/playwright/python:v1.43.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
 
 WORKDIR /app
 
-# Копируем все файлы в контейнер
-COPY . /app
-
-# Устанавливаем библиотеки Python
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN playwright install chromium
 
-# Запускаем бота
+COPY . .
+
 CMD ["python", "app.py"]
+
