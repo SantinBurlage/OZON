@@ -56,93 +56,53 @@ def save_db():
     except Exception:
         pass
 
-def extract_item_id(url: str) -> Optional[str]:
-    match = re.search(r"-(\d+)(?:\/?\?|$)", url)
-    if match:
-        return match.group(1)
-    match_alt = re.search(r"/context/detail/id/(\d+)", url)
-    if match_alt:
-        return match_alt.group(1)
-    return None
-
-async def check_ozon_api(url: str) -> Tuple[bool, str, str, str]:
+async def check_ozon_page_fast(url: str) -> Tuple[bool, str, str, str, Optional[bytes]]:
     global TOTAL_CHECKS_COUNT
     TOTAL_CHECKS_COUNT += 1
 
-    item_id = extract_item_id(url)
-    if not item_id:
-        return False, "Товар Ozon", "Не удалось найти ID", "—"
-
-    api_url = f"https://www.ozon.ru/api/composer-api.bx/page/json/v2?url=/context/detail/id/{item_id}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        "Referer": url
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9"
     }
 
     try:
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-            async with session.get(api_url, proxy=PROXY_URL, timeout=12) as response:
+            async with session.get(url, proxy=PROXY_URL, timeout=12) as response:
                 if response.status != 200:
-                    return False, "Товар Ozon", "—", f"HTTP {response.status}"
+                    return False, "Товар Ozon", "—", f"HTTP {response.status}", None
                 
-                data = await response.json()
-                widgets = data.get("widgetStates", {})
-                name = "Товар Ozon"
-                price = "Не определена"
-                is_available = True
+                html_content = await response.text()
 
-                for widget_key, widget_val in widgets.items():
-                    if "webProductHeading" in widget_key or "title" in widget_key:
-                        try:
-                            w_data = json.loads(widget_val)
-                            if "title" in w_data:
-                                name = w_data["title"]
-                        except:
-                            pass
-                    
-                    if "webPrice" in widget_key or "price" in widget_key:
-                        try:
-                            w_data = json.loads(widget_val)
-                            if "price" in w_data and isinstance(w_data["price"], list) and w_data["price"]:
-                                price = w_data["price"][0]
-                            elif "price" in w_data:
-                                price = str(w_data["price"])
-                            elif "cardPrice" in w_data and w_data["cardPrice"]:
-                                price = w_data["cardPrice"][0]
-                        except:
-                            pass
+                # Парсим OpenGraph теги, которые Ozon всегда заполняет для карточек
+                name_match = re.search(r'<meta property="og:title" content="([^"]+)"', html_content)
+                name = html.unescape(name_match.group(1)) if name_match else "Товар Ozon"
+                # Очищаем название от лишнего мусора в заголовке
+                name = re.sub(r"купить в интернет-магазине Ozon.*", "", name, flags=re.IGNORECASE).strip()
 
-                if price == "Не определена":
-                    raw_str = json.dumps(data)
-                    p_match = re.search(r'"price":\s*"([\d\s ]+₽?)"', raw_str)
-                    if p_match:
-                        price = p_match.group(1)
+                img_match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
+                img_url = img_match.group(1) if img_match else None
 
-                return is_available, name, price, "В наличии"
+                # Ищем цену в тексте страницы
+                price_match = re.search(r'([\d\s ]+)\s*₽', html_content)
+                price = f"{price_match.group(1).strip()} ₽" if price_match else "Не определена"
+
+                is_out_of_stock = bool(re.search(r"товар закончился|узнать о поступлении|нет в наличии", html_content, re.IGNORECASE))
+                has_buy_button = bool(re.search(r"в корзину|купить в 1 клик", html_content, re.IGNORECASE))
+                is_available = has_buy_button and not is_out_of_stock
+
+                # Скачиваем картинку товара через прокси, если нашли ссылку
+                photo_bytes = None
+                if img_url:
+                    async with session.get(img_url, proxy=PROXY_URL, timeout=8) as img_resp:
+                        if img_resp.status == 200:
+                            photo_bytes = await img_resp.read()
+
+                return is_available, name, price, ("В наличии" if is_available else "Нет в наличии"), photo_bytes
+
     except Exception as exc:
-        return False, "Ошибка связи", "—", str(exc)[:30]
-
-async def take_fast_screenshot(url: str) -> Optional[bytes]:
-    """Делает быстрый скриншот страницы через Playwright с таймаутом"""
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                proxy={"server": PROXY_URL},
-                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
-            )
-            context = await browser.new_context(viewport={"width": 1280, "height": 800})
-            page = await context.new_page()
-            await page.goto(url, wait_until="commit", timeout=10000)
-            await asyncio.sleep(1.5)
-            screenshot_bytes = await page.screenshot(type="jpeg", quality=75)
-            await browser.close()
-            return screenshot_bytes
-    except Exception:
-        return None
+        return False, "Ошибка связи", "—", str(exc)[:30], None
 
 def make_product_keyboard(url: str, item_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -160,12 +120,12 @@ async def monitoring_worker(chat_id: int):
         try:
             items = user_tracked_items.get(chat_id, [])
             for item in list(items):
-                is_avail, name, price, stock = await check_ozon_api(item["url"])
+                is_avail, name, price, stock, _ = await check_ozon_page_fast(item["url"])
                 item["name"] = name
                 item["price"] = price
                 item["status"] = is_avail
                 save_db()
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(3.0)
         except asyncio.CancelledError:
             break
         except Exception:
@@ -228,7 +188,9 @@ async def cmd_list(event):
     text = "📋 <b>Товары:</b>\n\n"
     for idx, item in enumerate(items, 1):
         price = item.get("price", "—")
-        text += f"{idx}. 🟢 <b>{item.get('name', 'Товар')}</b> — {price}\n"
+        st = item.get("status")
+        icon = "🟢" if st is True else "🔴"
+        text += f"{idx}. {icon} <b>{item.get('name', 'Товар')}</b> — {price}\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗑 Очистить", callback_data="clear_all_btn")],
@@ -263,24 +225,23 @@ async def handle_url(message: Message):
     if chat_id not in monitoring_tasks or monitoring_tasks[chat_id].done():
         monitoring_tasks[chat_id] = asyncio.create_task(monitoring_worker(chat_id))
 
-    wait_msg = await message.answer("⚡ Получаю данные и делаю скриншот...")
+    wait_msg = await message.answer("⚡ Загружаю данные и фото товара...")
     
-    is_avail, name, price, stock = await check_ozon_api(url)
+    is_avail, name, price, stock, photo_bytes = await check_ozon_page_fast(url)
     new_item["name"] = name
     new_item["price"] = price
     new_item["status"] = is_avail
     new_item["stock"] = stock
     save_db()
 
-    screenshot = await take_fast_screenshot(url)
-
-    caption = f"✅ <b>Добавлено</b>\n\n📦 <b>{name}</b>\n💰 Цена: <b>{price}</b>"
+    status_str = "🟢 В наличии" if is_avail else "🔴 Нет в наличии"
+    caption = f"✅ <b>Товар добавлен</b>\n\n📦 <b>{name}</b>\nСтатус: {status_str}\n💰 Цена: <b>{price}</b>"
     kb = make_product_keyboard(url, item_id)
     try: await wait_msg.delete()
     except: pass
 
-    if screenshot:
-        await message.answer_photo(BufferedInputFile(screenshot, filename="ozon.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
+    if photo_bytes:
+        await message.answer_photo(BufferedInputFile(photo_bytes, filename="ozon_item.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
     else:
         await message.answer(caption, parse_mode="HTML", reply_markup=kb)
 
@@ -296,16 +257,16 @@ async def callback_check_now(callback: CallbackQuery):
         return
 
     await callback.answer("Проверяю...")
-    is_avail, name, price, stock = await check_ozon_api(target["url"])
+    is_avail, name, price, stock, photo_bytes = await check_ozon_page_fast(target["url"])
     target["name"], target["price"], target["status"], target["stock"] = name, price, is_avail, stock
     save_db()
 
-    screenshot = await take_fast_screenshot(target["url"])
-    caption = f"🔄 <b>Обновлено:</b>\n📦 {name}\n💰 {price}"
+    status_str = "🟢 В наличии" if is_avail else "🔴 Нет в наличии"
+    caption = f"🔄 <b>Обновлено:</b>\n\n📦 <b>{name}</b>\nСтатус: {status_str}\n💰 Цена: <b>{price}</b>"
     kb = make_product_keyboard(target["url"], item_id)
 
-    if screenshot:
-        await callback.message.answer_photo(BufferedInputFile(screenshot, filename="ozon.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
+    if photo_bytes:
+        await callback.message.answer_photo(BufferedInputFile(photo_bytes, filename="ozon_item.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
     else:
         await callback.message.answer(caption, parse_mode="HTML", reply_markup=kb)
 
@@ -323,7 +284,7 @@ async def callback_delete_item(callback: CallbackQuery):
 async def callback_stats(callback: CallbackQuery):
     uptime_str = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
     tracked_count = len(user_tracked_items.get(callback.message.chat.id, []))
-    text = f"📊 <b>Статус:</b>\n\n⏱ Аптайм: {uptime_str}\n📦 Товаров: {tracked_count}\n⚡ Режим: API + Скриншоты"
+    text = f"📊 <b>Статус:</b>\n\n⏱ Аптайм: {uptime_str}\n📦 Товаров: {tracked_count}\n⚡ Режим: Direct HTML + Фото"
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main_btn")]])
     await callback.answer()
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -341,7 +302,7 @@ async def callback_back_to_main(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     username = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.first_name
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup(inline_keyword=[
         [InlineKeyboardButton(text="📋 Список", callback_data="show_list_btn")],
         [InlineKeyboardButton(text="📊 Статус", callback_data="show_stats_btn")]
     ])
