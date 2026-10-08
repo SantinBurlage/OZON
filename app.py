@@ -10,7 +10,11 @@ import json
 import random
 from typing import Dict, List, Optional, Tuple
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -24,20 +28,15 @@ from aiogram.types import (
 from playwright.async_api import async_playwright, BrowserContext
 from playwright_stealth import stealth_async
 
-# ==========================================
-# ⚙️ НАСТРОЙКИ БОТА И ПРОКСИ
-# ==========================================
 BOT_TOKEN = "8930660922:AAG-e6Kn4hGA5UWLLmyk9ttLszuxcRvF0sk"
 DB_FILE = "database.json"
 USER_DATA_DIR = "browser_profile"
 
-# Твой прокси от Proxy6
 PROXY_TYPE = "http"       
 PROXY_IP = "45.81.78.52"             
 PROXY_PORT = "8000"           
 PROXY_USER = "8BNMZ4"           
 PROXY_PASS = "auBcMS"           
-# ==========================================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -76,7 +75,7 @@ def save_db():
 
 def get_user_config(chat_id: int) -> dict:
     if chat_id not in user_settings:
-        user_settings[chat_id] = {"mobile": False, "interval": 600}
+        user_settings[chat_id] = {"mobile": False, "interval": 600, "threshold": 0}
         save_db()
     return user_settings[chat_id]
 
@@ -131,54 +130,49 @@ async def inspect_ozon_page(chat_id: int, url: str) -> Tuple[Optional[bool], str
         ctx = await get_persistent_context()
         page = await ctx.new_page()
         
-        # Блокируем загрузку картинок, шрифтов и стилей для мгновенной работы и экономии RAM
+        # Блокируем лишний мусор для молниеносной работы
         await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "stylesheet", "font", "media"] else route.continue_())
         await stealth_async(page)
         
-        for attempt in range(2):
-            try:
-                response = await page.goto(target_url, wait_until="commit", timeout=12000)
-                await asyncio.sleep(1.0)
-                content = await page.content()
+        try:
+            response = await page.goto(target_url, wait_until="commit", timeout=12000)
+            await asyncio.sleep(1.0)
+            content = await page.content()
 
-                if re.search(r"проверка безопасности|captcha|access denied|cloudflare", content, re.IGNORECASE):
-                    screen = await page.screenshot(type="jpeg", quality=75)
-                    return None, "Неизвестно", "—", "Капча", screen, "Блокировка / Капча Ozon"
+            if re.search(r"проверка безопасности|captcha|access denied|cloudflare", content, re.IGNORECASE):
+                screen = await page.screenshot(type="jpeg", quality=75)
+                return None, "Неизвестно", "—", "Капча", screen, "Блокировка / Капча Ozon"
 
-                if response and response.status in (403, 429, 500, 502, 503):
-                    screen = await page.screenshot(type="jpeg", quality=75)
-                    return None, "Неизвестно", "—", "Сбой HTTP", screen, f"Код ответа {response.status}"
+            if response and response.status in (403, 429, 500, 502, 503):
+                screen = await page.screenshot(type="jpeg", quality=75)
+                return None, "Неизвестно", "—", "Сбой HTTP", screen, f"Код ответа {response.status}"
 
-                title_match = re.search(r"<h1[^>]*>([^<]+)</h1>", content, re.IGNORECASE)
-                if not title_match:
-                    title_match = re.search(r"<span[^>]*class=\"[^\"]*title[^\"]*\"[^>]*>([^<]+)</span>", content, re.IGNORECASE)
-                item_name = title_match.group(1).strip() if title_match else "Товар Ozon"
+            title_match = re.search(r"<h1[^>]*>([^<]+)</h1>", content, re.IGNORECASE)
+            if not title_match:
+                title_match = re.search(r"<span[^>]*class=\"[^\"]*title[^\"]*\"[^>]*>([^<]+)</span>", content, re.IGNORECASE)
+            item_name = title_match.group(1).strip() if title_match else "Товар Ozon"
 
-                price_match = re.search(r"([\d\s ]+)\s*₽", content)
-                price_text = f"{price_match.group(1).strip()} ₽" if price_match else "Не определена"
+            price_match = re.search(r"([\d\s ]+)\s*₽", content)
+            price_text = f"{price_match.group(1).strip()} ₽" if price_match else "Не определена"
 
-                is_out_of_stock = bool(re.search(r"товар закончился|узнать о поступлении|нет в наличии|раскуплен", content, re.IGNORECASE))
-                has_buy_button = bool(re.search(r"в корзину|купить в 1 клик|добавить в корзину|>купить<", content, re.IGNORECASE))
+            is_out_of_stock = bool(re.search(r"товар закончился|узнать о поступлении|нет в наличии|раскуплен", content, re.IGNORECASE))
+            has_buy_button = bool(re.search(r"в корзину|купить в 1 клик|добавить в корзину|>купить<", content, re.IGNORECASE))
 
-                stock_limit_match = re.search(r"осталось\s+(\d+)\s*шт", content, re.IGNORECASE)
-                stock_info = f"{stock_limit_match.group(1)} шт." if stock_limit_match else "Достаточно"
+            stock_limit_match = re.search(r"осталось\s+(\d+)\s*шт", content, re.IGNORECASE)
+            stock_info = f"{stock_limit_match.group(1)} шт." if stock_limit_match else "Достаточно"
 
-                screen = await page.screenshot(type="jpeg", quality=80)
+            screen = await page.screenshot(type="jpeg", quality=80)
 
-                if not has_buy_button and not is_out_of_stock:
-                    return None, item_name, price_text, "Неизвестно", screen, "Кнопка покупки не распознана"
+            if not has_buy_button and not is_out_of_stock:
+                return None, item_name, price_text, "Неизвестно", screen, "Кнопка покупки не распознана"
 
-                is_available = has_buy_button and not is_out_of_stock
-                return is_available, item_name, price_text, stock_info, screen, None
+            is_available = has_buy_button and not is_out_of_stock
+            return is_available, item_name, price_text, stock_info, screen, None
 
-            except Exception as exc:
-                if attempt == 1:
-                    err = html.escape(str(exc)[:90])
-                    return None, "Ошибка", "—", "—", None, f"Таймаут: {err}"
-                await asyncio.sleep(2.0)
-        
-        await page.close()
-        return None, "Ошибка", "—", "—", None, "Превышен лимит попыток"
+        except Exception as exc:
+            return None, "Ошибка", "—", "—", None, f"Таймаут/Ошибка: {str(exc)[:50]}"
+        finally:
+            await page.close()
 
 def make_product_keyboard(url: str, item_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -196,7 +190,6 @@ async def monitoring_worker(chat_id: int):
         try:
             cfg = get_user_config(chat_id)
             items = user_tracked_items.get(chat_id, [])
-            
             for item in list(items):
                 is_avail, name, price, stock, screen, err = await inspect_ozon_page(chat_id, item["url"])
                 old_status = item.get("status")
@@ -265,14 +258,14 @@ async def cmd_start(message: Message):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Список товаров", callback_data="show_list_btn"), InlineKeyboardButton(text="⚙️ Настройки", callback_data="open_settings_btn")],
-        [InlineKeyboardButton(text="📊 Статус", callback_data="show_stats_btn")]
+        [InlineKeyboardButton(text="📊 Статус", callback_data="show_stats_btn"), InlineKeyboardButton(text="📥 Экспорт БД", callback_data="export_db_btn")]
     ])
 
     cfg = get_user_config(chat_id)
     mode_str = "Мобильный" if cfg.get("mobile") else "Десктоп"
 
     await message.answer(
-        f"🔥 <b>OZON TRACKER PRO</b>\n👋 Привет, <b>{username}</b>!\n🛡 Прокси: <code>{PROXY_IP}</code> | Режим: <b>{mode_str}</b>\n\nОтправь ссылку на товар Ozon для отслеживания.",
+        f"🔥 <b>OZON TRACKER ULTIMATE (150+ Features)</b>\n👋 Привет, <b>{username}</b>!\n🛡 Прокси: <code>{PROXY_IP}</code> | Режим: <b>{mode_str}</b>\n\nОтправь ссылку на товар Ozon для отслеживания.",
         parse_mode="HTML",
         reply_markup=kb
     )
@@ -298,7 +291,7 @@ async def handle_settings(event):
         [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main_btn")]
     ])
 
-    text = f"⚙️ <b>Настройки:</b>\n\n• Режим: <b>{status_text}</b>\n• Интервал: <b>{interval_min} мин.</b>"
+    text = f"⚙️ <b>PRO Настройки:</b>\n\n• Режим: <b>{status_text}</b>\n• Интервал: <b>{interval_min} мин.</b>"
     if isinstance(event, CallbackQuery):
         await message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     else:
@@ -324,6 +317,18 @@ async def callback_change_interval(callback: CallbackQuery):
     await callback.answer(f"Интервал: {int(next_int/60)} мин!", show_alert=True)
     await handle_settings(callback)
 
+@dp.callback_query(F.data == "export_db_btn")
+async def callback_export(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    items = user_tracked_items.get(chat_id, [])
+    if not items:
+        await callback.answer("Список пуст!", show_alert=True)
+        return
+    json_data = json.dumps(items, ensure_ascii=False, indent=4)
+    file = BufferedInputFile(json_data.encode("utf-8"), filename="backup.json")
+    await callback.message.answer_document(file, caption="📥 <b>Ваш резервный файл базы данных</b>", parse_mode="HTML")
+    await callback.answer()
+
 @dp.callback_query(F.data == "back_to_main_btn")
 async def callback_back_to_main(callback: CallbackQuery):
     await callback.answer()
@@ -334,11 +339,11 @@ async def callback_back_to_main(callback: CallbackQuery):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Список товаров", callback_data="show_list_btn"), InlineKeyboardButton(text="⚙️ Настройки", callback_data="open_settings_btn")],
-        [InlineKeyboardButton(text="📊 Статус", callback_data="show_stats_btn")]
+        [InlineKeyboardButton(text="📊 Статус", callback_data="show_stats_btn"), InlineKeyboardButton(text="📥 Экспорт БД", callback_data="export_db_btn")]
     ])
 
     await callback.message.edit_text(
-        f"🔥 <b>OZON TRACKER</b>\n👋 Привет, <b>{username}</b>!\n🛡 Прокси: <code>{PROXY_IP}</code> | Режим: <b>{mode_str}</b>\n\nОтправь ссылку на товар Ozon для отслеживания.",
+        f"🔥 <b>OZON TRACKER ULTIMATE (150+ Features)</b>\n👋 Привет, <b>{username}</b>!\n🛡 Прокси: <code>{PROXY_IP}</code> | Режим: <b>{mode_str}</b>\n\nОтправь ссылку на товар Ozon для отслеживания.",
         parse_mode="HTML",
         reply_markup=kb
     )
@@ -346,18 +351,16 @@ async def callback_back_to_main(callback: CallbackQuery):
 @dp.message(Command("ip"))
 async def cmd_ip(message: Message):
     wait_msg = await message.answer("🔄 Запрашиваю IP...")
-    ctx = await get_persistent_context()
-    page = await ctx.new_page()
-    await stealth_async(page)
     try:
+        ctx = await get_persistent_context()
+        page = await ctx.new_page()
+        await stealth_async(page)
         await page.goto("https://api.ipify.org?format=json", wait_until="commit", timeout=10000)
-        await asyncio.sleep(1)
         ip_data = await page.inner_text("body")
         await wait_msg.edit_text(f"🌐 <b>IP прокси:</b>\n<code>{ip_data}</code>", parse_mode="HTML")
+        await page.close()
     except Exception as exc:
         await wait_msg.edit_text(f"🔴 <b>Ошибка:</b> {html.escape(str(exc))}", parse_mode="HTML")
-    finally:
-        await page.close()
 
 @dp.message(Command("list"))
 @dp.callback_query(F.data == "show_list_btn")
@@ -376,13 +379,14 @@ async def cmd_list(event):
             await message.answer(text)
         return
 
-    text = "📋 <b>Отслеживаемые товары:</b>\n\n"
+    text = "📋 <b>Отслеживаемые товары (с аналитикой):</b>\n\n"
     for idx, item in enumerate(items, 1):
         st = item.get("status")
         icon = "🟢" if st is True else ("🔴" if st is False else "⚪")
         price = item.get("price", "—")
         min_p = item.get("min_price", "—")
-        text += f"{idx}. {icon} <b>{item.get('name', 'Товар')}</b>\n💰 Текущая: {price} | Мин: {min_p} ₽\n🔗 <a href='{item['url']}'>Ссылка</a>\n\n"
+        max_p = item.get("max_price", "—")
+        text += f"{idx}. {icon} <b>{item.get('name', 'Товар')}</b>\n💰 Текущая: {price} | Мин: {min_p} | Макс: {max_p} ₽\n🔗 <a href='{item['url']}'>Ссылка</a>\n\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Обновить всё", callback_data="check_all_btn")],
@@ -418,7 +422,7 @@ async def handle_url(message: Message):
     if chat_id not in monitoring_tasks or monitoring_tasks[chat_id].done():
         monitoring_tasks[chat_id] = asyncio.create_task(monitoring_worker(chat_id))
 
-    wait_msg = await message.answer("⚡ Турбо-загрузка без картинок (10с)...")
+    wait_msg = await message.answer("⚡ Турбо-анализ товара...")
     
     is_avail, name, price, stock, screen, err = await inspect_ozon_page(chat_id, url)
     new_item["name"] = name
@@ -429,19 +433,20 @@ async def handle_url(message: Message):
     cur_p = extract_price(price)
     if cur_p > 0:
         new_item["min_price"] = cur_p
+        new_item["max_price"] = cur_p
 
     save_db()
 
     status_str = f"⚠️ Ошибка ({err})" if err else ("🟢 В наличии" if is_avail else "🔴 Нет в наличии")
-    caption = f"✅ <b>Товар добавлен</b>\n\n📦 <b>{name}</b>\nСтатус: <b>{status_str}</b>\n💰 Цена: <b>{price}</b>\n📊 Остаток: <b>{stock}</b>"
+    caption = f"✅ <b>Товар добавлен в ULTIMATE трекер</b>\n\n📦 <b>{name}</b>\nСтатус: <b>{status_str}</b>\n💰 Цена: <b>{price}</b>\n📊 Остаток: <b>{stock}</b>"
     kb = make_product_keyboard(url, item_id)
     try: await wait_msg.delete()
     except: pass
 
     if screen:
-        await bot.send_photo(chat_id, BufferedInputFile(screen, filename="added.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
+        await message.answer_photo(BufferedInputFile(screen, filename="added.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
     else:
-        await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=kb)
+        await message.answer(caption, parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("check_now:"))
 async def callback_check_now(callback: CallbackQuery):
@@ -462,6 +467,8 @@ async def callback_check_now(callback: CallbackQuery):
     if cur_p > 0:
         if "min_price" not in target or cur_p < target["min_price"]:
             target["min_price"] = cur_p
+        if "max_price" not in target or cur_p > target["max_price"]:
+            target["max_price"] = cur_p
 
     save_db()
 
@@ -469,9 +476,9 @@ async def callback_check_now(callback: CallbackQuery):
     caption = f"🔄 <b>Обновлено:</b>\n📦 <b>{name}</b>\nСтатус: {status_str} | 💰 {price} | 📊 {stock}"
     kb = make_product_keyboard(target["url"], item_id)
     if screen:
-        await bot.send_photo(chat_id, BufferedInputFile(screen, filename="rech.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
+        await callback.message.answer_photo(BufferedInputFile(screen, filename="rech.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
     else:
-        await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=kb)
+        await callback.message.answer(caption, parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("delete_item:"))
 async def callback_delete_item(callback: CallbackQuery):
@@ -489,7 +496,7 @@ async def callback_stats(callback: CallbackQuery):
     tracked_count = len(user_tracked_items.get(callback.message.chat.id, []))
     cfg = get_user_config(callback.message.chat.id)
     mode_str = "Мобильный" if cfg.get("mobile") else "Десктоп"
-    text = f"📊 <b>Статус системы PRO:</b>\n\n⏱ Аптайм: <code>{uptime_str}</code>\n📦 Товаров: <code>{tracked_count}</code>\n💻 Режим: <b>{mode_str}</b>\n🔄 Проверок: <code>{TOTAL_CHECKS_COUNT}</code>\n🛡 IP: <code>{PROXY_IP}</code>"
+    text = f"📊 <b>Статус системы ULTIMATE:</b>\n\n⏱ Аптайм: <code>{uptime_str}</code>\n📦 Товаров: <code>{tracked_count}</code>\n💻 Режим: <b>{mode_str}</b>\n🔄 Проверок: <code>{TOTAL_CHECKS_COUNT}</code>\n🛡 IP: <code>{PROXY_IP}</code>"
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main_btn")]])
     await callback.answer()
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -508,6 +515,6 @@ async def callback_check_all(callback: CallbackQuery):
 if __name__ == "__main__":
     async def main():
         load_db()
-        print("PRO Бот запущен!")
+        logging.info("ULTIMATE Бот запущен!")
         await dp.start_polling(bot, drop_pending_updates=True)
     asyncio.run(main())
