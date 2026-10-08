@@ -28,9 +28,12 @@ from playwright_stealth import stealth_async
 # ⚙️ НАСТРОЙКИ БОТА И ПРОКСИ
 # ==========================================
 BOT_TOKEN = "8930660922:AAG-e6Kn4hGA5UWLLmyk9ttLszuxcRvF0sk"
-CHECK_INTERVAL_SECONDS = 600  # 10 минут — идеальный интервал для тишины от капч
+CHECK_INTERVAL_SECONDS = 600
 DB_FILE = "database.json"
 USER_DATA_DIR = "browser_profile"
+
+# ВЫБОР РЕЖИМА: True = мобильная версия (m.ozon.ru), False = полная десктопная версия (www.ozon.ru)
+USE_MOBILE_VERSION = False 
 
 # Твой прокси от Proxy6
 PROXY_TYPE = "http"       
@@ -40,8 +43,8 @@ PROXY_USER = "8BNMZ4"
 PROXY_PASS = "auBcMS"           
 # ==========================================
 
-# Мобильный User-Agent (на мобильной версии Ozon защиты почти нет)
-MOBILE_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -76,10 +79,11 @@ def extract_price(price_str: str) -> int:
     digits = re.sub(r"\D", "", price_str)
     return int(digits) if digits else 0
 
-def convert_to_mobile_url(url: str) -> str:
-    """Превращает десктопную ссылку Ozon в мобильную для обхода защиты"""
-    url = url.replace("www.ozon.ru", "m.ozon.ru").replace("ozon.ru", "m.ozon.ru")
-    return url
+def prepare_url(url: str) -> str:
+    if USE_MOBILE_VERSION:
+        return url.replace("www.ozon.ru", "m.ozon.ru").replace("ozon.ru", "m.ozon.ru")
+    else:
+        return url.replace("m.ozon.ru", "www.ozon.ru")
 
 async def get_persistent_context() -> BrowserContext:
     global persistent_context
@@ -94,15 +98,18 @@ async def get_persistent_context() -> BrowserContext:
         
         os.makedirs(USER_DATA_DIR, exist_ok=True)
         
+        ua = MOBILE_UA if USE_MOBILE_VERSION else DESKTOP_UA
+        vp = {"width": 390, "height": 844} if USE_MOBILE_VERSION else {"width": 1920, "height": 1080}
+        
         persistent_context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             headless=True,
             proxy=proxy_conf,
-            user_agent=MOBILE_USER_AGENT,
-            viewport={"width": 390, "height": 844},  # Размер экрана iPhone 12/13/14
-            device_scale_factor=3,
-            is_mobile=True,
-            has_touch=True,
+            user_agent=ua,
+            viewport=vp,
+            device_scale_factor=3 if USE_MOBILE_VERSION else 1,
+            is_mobile=USE_MOBILE_VERSION,
+            has_touch=USE_MOBILE_VERSION,
             locale="ru-RU",
             timezone_id="Europe/Moscow",
             args=[
@@ -121,7 +128,7 @@ async def inspect_ozon_page(url: str) -> Tuple[Optional[bool], str, str, str, Op
     global TOTAL_CHECKS_COUNT
     TOTAL_CHECKS_COUNT += 1
 
-    mobile_url = convert_to_mobile_url(url)
+    target_url = prepare_url(url)
 
     async with browser_lock:
         ctx = await get_persistent_context()
@@ -130,12 +137,11 @@ async def inspect_ozon_page(url: str) -> Tuple[Optional[bool], str, str, str, Op
         await stealth_async(page)
         
         try:
-            response = await page.goto(mobile_url, wait_until="domcontentloaded", timeout=45000)
+            response = await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             
-            # Легкие мобильные движения
             await asyncio.sleep(random.uniform(2.0, 3.5))
             await page.mouse.wheel(0, random.randint(300, 600))
-            await asyncio.sleep(random.uniform(1.5, 2.5))
+            await asyncio.sleep(1.0)
 
             content = await page.content()
 
@@ -147,10 +153,10 @@ async def inspect_ozon_page(url: str) -> Tuple[Optional[bool], str, str, str, Op
                 screen = await page.screenshot(type="jpeg", quality=75)
                 return None, "Неизвестно", "—", "Сбой HTTP", screen, f"Код ответа {response.status}"
 
-            # Парсинг названия для мобильной версии
-            title_match = re.search(r"<span[^>]*class=\"[^\"]*title[^\"]*\"[^>]*>([^<]+)</span>", content, re.IGNORECASE)
+            # Парсинг названия
+            title_match = re.search(r"<h1[^>]*>([^<]+)</h1>", content, re.IGNORECASE)
             if not title_match:
-                title_match = re.search(r"<h1[^>]*>([^<]+)</h1>", content, re.IGNORECASE)
+                title_match = re.search(r"<span[^>]*class=\"[^\"]*title[^\"]*\"[^>]*>([^<]+)</span>", content, re.IGNORECASE)
             item_name = title_match.group(1).strip() if title_match else "Товар Ozon"
 
             # Парсинг цены
@@ -158,7 +164,7 @@ async def inspect_ozon_page(url: str) -> Tuple[Optional[bool], str, str, str, Op
             price_text = f"{price_match.group(1).strip()} ₽" if price_match else "Не определена"
 
             is_out_of_stock = bool(re.search(r"товар закончился|узнать о поступлении|нет в наличии", content, re.IGNORECASE))
-            has_buy_button = bool(re.search(r"в корзину|купить в 1 клик|добавить в корзину", content, re.IGNORECASE))
+            has_buy_button = bool(re.search(r"в корзину|купить в 1 клик|добавить в корзину|>купить<", content, re.IGNORECASE))
 
             stock_limit_match = re.search(r"осталось\s+(\d+)\s*шт", content, re.IGNORECASE)
             stock_info = f"{stock_limit_match.group(1)} шт." if stock_limit_match else "Достаточно"
@@ -206,7 +212,7 @@ async def monitoring_worker(chat_id: int):
                 if err is not None:
                     if item.get("last_error") != err:
                         item["last_error"] = err
-                        caption = f"⚠️ <b>Сбой проверки:</b>\n📦 {name}\n⚠️ <code>{err}</code>"
+                        caption = f"⚠️ Сбой проверки:\n📦 {name}\n⚠️ {err}"
                         kb = make_product_keyboard(item["url"], item["id"])
                         if screen:
                             await bot.send_photo(chat_id, BufferedInputFile(screen, filename="err.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
@@ -241,7 +247,7 @@ async def monitoring_worker(chat_id: int):
                         )
                         await bot.send_photo(chat_id, BufferedInputFile(screen, filename="sale.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
 
-                await asyncio.sleep(random.uniform(4.0, 8.0))
+                await asyncio.sleep(random.uniform(5.0, 10.0))
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -264,11 +270,14 @@ async def cmd_start(message: Message):
         [InlineKeyboardButton(text="📋 Мой список", callback_data="show_list_btn"), InlineKeyboardButton(text="📊 Статус", callback_data="show_stats_btn")]
     ])
 
+    mode_str = "Мобильный (m.ozon.ru)" if USE_MOBILE_VERSION else "Десктопный (www.ozon.ru)"
+
     await message.answer(
         f"🔥 <b>OZON TRACKER</b> ✨\n"
         f"👋 Привет, <b>{username}</b>!\n"
-        f"🛡 Прокси подключен: <code>{PROXY_IP}</code>\n\n"
-        f"Мобильный стелс-режим активен (обход защиты в 10 раз мощнее).",
+        f"🛡 Прокси: <code>{PROXY_IP}</code>\n"
+        f"💻 Режим: <b>{mode_str}</b>\n\n"
+        f"Отправь ссылку на товар для отслеживания.",
         parse_mode="HTML",
         reply_markup=kb
     )
@@ -280,7 +289,7 @@ async def cmd_ip(message: Message):
     page = await ctx.new_page()
     await stealth_async(page)
     try:
-        await page.goto("https://api.ipify.org?format=json", wait_until="commit", timeout=25000)
+        await page.goto("https://api.ipify.org?format=json", wait_until="commit", timeout=20000)
         await asyncio.sleep(1)
         ip_data = await page.inner_text("body")
         await wait_msg.edit_text(f"🌐 <b>Выходной IP:</b>\n<code>{ip_data}</code>", parse_mode="HTML")
@@ -334,7 +343,7 @@ async def handle_url(message: Message):
     if chat_id not in monitoring_tasks or monitoring_tasks[chat_id].done():
         monitoring_tasks[chat_id] = asyncio.create_task(monitoring_worker(chat_id))
 
-    wait_msg = await message.answer("🎯 <b>Добавлено!</b> Загружаю через мобильный шлюз...")
+    wait_msg = await message.answer("🎯 Загрузка данных товара...")
     
     is_avail, name, price, stock, screen, err = await inspect_ozon_page(url)
     new_item["name"] = name
@@ -407,11 +416,12 @@ async def callback_list(callback: CallbackQuery):
 async def callback_stats(callback: CallbackQuery):
     uptime_str = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
     tracked_count = len(user_tracked_items.get(callback.message.chat.id, []))
+    mode_str = "Мобильный" if USE_MOBILE_VERSION else "Десктоп"
     text = (
         f"📊 <b>Панель управления:</b>\n\n"
         f"⏱ Аптайм: <code>{uptime_str}</code>\n"
         f"📦 Ваших товаров: <code>{tracked_count}</code>\n"
-        f"🔄 Всего проверок: <code>{TOTAL_CHECKS_COUNT}</code>\n"
+        f"💻 Режим: <b>{mode_str}</b>\n"
         f"🛡 IP Прокси: <code>{PROXY_IP}</code>"
     )
     await callback.answer()
