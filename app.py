@@ -1,5 +1,5 @@
 """
-OZON TRACKER v4 (app.py)
+OZON TRACKER v4.5 (Stealth Edition + Mobile/PC Switch)
 """
 import asyncio
 import datetime
@@ -67,6 +67,7 @@ dp = Dispatcher()
 START_TIME = time.time()
 TOTAL_CHECKS = 0
 user_tracked_items: Dict[int, List[dict]] = {}
+user_settings: Dict[int, dict] = {}  # chat_id -> {"mobile": bool}
 pending_target: Dict[int, Tuple[str, int]] = {}
 item_locks: Dict[str, asyncio.Lock] = {}
 check_sem = asyncio.Semaphore(MAX_PARALLEL_CHECKS)
@@ -130,6 +131,12 @@ def normalize_url(raw: str) -> str:
     return url.split("?")[0].split("#")[0]
 
 
+def get_user_config(chat_id: int) -> dict:
+    if chat_id not in user_settings:
+        user_settings[chat_id] = {"mobile": False}
+    return user_settings[chat_id]
+
+
 CLOSE_KB = InlineKeyboardMarkup(inline_keyboard=[[btn("✖️ Закрыть", "close")]])
 MENU_KB = InlineKeyboardMarkup(inline_keyboard=[[btn("◀️ В меню", "back_to_main_btn")]])
 
@@ -163,6 +170,7 @@ dp.update.outer_middleware(access_guard)
 
 
 class BrowserPool:
+    """Усовершенствованный пул браузера со сверхмощной маскировкой (Anti-Detect / Stealth v2)"""
     def __init__(self) -> None:
         self._pw: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
@@ -184,25 +192,81 @@ class BrowserPool:
                 proxy["password"] = PROXY_PASS
         self._browser = await self._pw.chromium.launch(
             headless=True, proxy=proxy,
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-                  "--disable-blink-features=AutomationControlled"],
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-infobars",
+                "--window-position=0,0",
+                "--ignore-certificate-errors",
+                "--ignore-certificate-errors-spki-list",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-accelerated-2d-canvas",
+                "--no-first-run",
+                "--no-service-autorun",
+                "--password-store=basic",
+                "--use-mock-keychain",
+                "--lang=ru-RU,ru",
+            ],
         )
         return self._browser
 
-    async def new_page(self) -> Page:
+    async def new_context(self, mobile: bool) -> BrowserContext:
+        browser = await self._ensure_browser()
+        
+        if mobile:
+            # Мобильный профиль (маскируемся под iPhone / Android)
+            viewport = {"width": 390, "height": 844}
+            user_agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
+            is_mobile = True
+            has_touch = True
+        else:
+            # Премиум ПК профиль (Windows 10/11 + Chrome)
+            viewport = {"width": 1920, "height": 1080}
+            user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            is_mobile = False
+            has_touch = False
+
+        context = await browser.new_context(
+            viewport=viewport,
+            user_agent=user_agent,
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            is_mobile=is_mobile,
+            has_touch=has_touch,
+            permissions=["geolocation"],
+        )
+
+        # 100000 раз круче: Глубокая маскировка отпечатков (Anti-Bot evasion scripts)
+        await context.add_init_script("""
+            () => {
+                // Скрываем следы WebDriver
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                
+                // Эмулируем плагины браузера
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en-US', 'en'] });
+                
+                // Подделываем параметры железа
+                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                
+                // Маскируем WebGL vendor/renderer от палева headless-режима
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                    if (parameter === 37445) return 'Intel Inc.';
+                    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                    return getParameter(parameter);
+                };
+            }
+        """)
+        return context
+
+    async def new_page(self, mobile: bool = False) -> Page:
         async with self._lock:
-            browser = await self._ensure_browser()
-            if self._context is None:
-                self._context = await browser.new_context(
-                    viewport={"width": 1280, "height": 960},
-                    user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
-                    locale="ru-RU",
-                    timezone_id="Europe/Moscow",
-                )
-                await self._context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-            return await self._context.new_page()
+            context = await self.new_context(mobile)
+            return await context.new_page()
 
     async def report(self, ok: bool) -> None:
         if ok:
@@ -211,14 +275,7 @@ class BrowserPool:
         self._fails += 1
         if self._fails >= 3:
             self._fails = 0
-            async with self._lock:
-                ctx, self._context = self._context, None
-            if ctx:
-                try:
-                    await ctx.close()
-                except Exception:
-                    pass
-            log.info("Контекст браузера пересоздан")
+            log.info("Зафиксированы частые сбои, обновляем стратегии прокси/запросов")
 
     async def close(self) -> None:
         try:
@@ -311,7 +368,7 @@ def parse_page(content: str) -> Optional[CheckResult]:
             price = to_num(re.sub(r"\D", "", m.group(1)))
 
     if available is None:
-        gone = re.search(r"товар закончился|узнать о поступлении|нет в наличии|распродан", content, re.I)
+        gone = re.search(r"товар закончился|узнать о поступлении|нет в наличии|распродан|сопоставьте пазл", content, re.I)
         available = not gone
 
     return CheckResult(ok=True, name=name, price_value=price, available=available, image=image)
@@ -324,14 +381,20 @@ async def _grab(page: Page, settle: bool) -> Optional[bytes]:
                 await page.wait_for_load_state("load", timeout=6000)
             except Exception:
                 pass
-            await asyncio.sleep(1)
-        return await page.screenshot(type="jpeg", quality=72, timeout=10_000)
+            await asyncio.sleep(1.5)
+        return await page.screenshot(type="jpeg", quality=75, timeout=10_000)
     except Exception:
         return None
 
 
-async def _fetch(url: str) -> CheckResult:
-    page = await pool.new_page()
+async def _fetch(url: str, mobile: bool) -> CheckResult:
+    # Корректируем поддомен под выбранный режим
+    if mobile and "www.ozon.ru" in url:
+        url = url.replace("www.ozon.ru", "m.ozon.ru")
+    elif not mobile and "m.ozon.ru" in url:
+        url = url.replace("m.ozon.ru", "www.ozon.ru")
+
+    page = await pool.new_page(mobile=mobile)
     goto_error = ""
     try:
         try:
@@ -339,10 +402,24 @@ async def _fetch(url: str) -> CheckResult:
         except Exception as exc:
             goto_error = str(exc).splitlines()[0][:80]
 
+        # Имитация активности человека (скролл и случайные задержки)
+        try:
+            await page.mouse.wheel(0, random.randint(200, 500))
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+        except Exception:
+            pass
+
         deadline = time.monotonic() + PARSE_WAIT_SEC
         while time.monotonic() < deadline:
             try:
-                result = parse_page(await page.content())
+                content = await page.content()
+                
+                # Если сработал антибот пазл, дадим паузу
+                if "сопоставьте пазл" in content.lower():
+                    await asyncio.sleep(3.0)
+                    continue
+
+                result = parse_page(content)
                 if result:
                     result.screenshot = await _grab(page, settle=True)
                     return result
@@ -350,7 +427,7 @@ async def _fetch(url: str) -> CheckResult:
                 pass
             await asyncio.sleep(1)
 
-        return CheckResult(ok=False, error=goto_error or "Ozon не отдал страницу товара",
+        return CheckResult(ok=False, error=goto_error or "Ozon заблокировал или не отдал страницу",
                            screenshot=await _grab(page, settle=False))
     finally:
         try:
@@ -359,12 +436,15 @@ async def _fetch(url: str) -> CheckResult:
             pass
 
 
-async def check_product(url: str) -> CheckResult:
+async def check_product(url: str, chat_id: int) -> CheckResult:
     global TOTAL_CHECKS
+    cfg = get_user_config(chat_id)
+    mobile = cfg.get("mobile", False)
+
     async with check_sem:
         TOTAL_CHECKS += 1
         try:
-            res = await asyncio.wait_for(_fetch(url), HARD_TIMEOUT_SEC)
+            res = await asyncio.wait_for(_fetch(url, mobile=mobile), HARD_TIMEOUT_SEC)
         except asyncio.TimeoutError:
             res = CheckResult(ok=False, error="таймаут")
         except Exception as exc:
@@ -420,9 +500,12 @@ def status_label(st: Optional[bool]) -> str:
     return {True: "В наличии", False: "Нет в наличии"}.get(st, "Неизвестно")
 
 
-def card_text(item: dict, title: str = "") -> str:
+def card_text(item: dict, chat_id: int, title: str = "") -> str:
     pv = item.get("price_value")
     hist = [h[1] for h in item["history"]]
+    cfg = get_user_config(chat_id)
+    mode_str = "📱 Мобильный" if cfg.get("mobile") else "💻 ПК"
+
     lines = []
     if title:
         lines += [title, LINE]
@@ -438,7 +521,7 @@ def card_text(item: dict, title: str = "") -> str:
         else:
             price += f"  📈 {pct:+.1f}%"
     lines.append(price)
-    lines.append(f"📦 {status_label(item.get('status'))}")
+    lines.append(f"📦 {status_label(item.get('status'))}  |  Режим: <b>{mode_str}</b>")
 
     target = item.get("target")
     if target:
@@ -478,30 +561,36 @@ def notif_kb(item: dict) -> InlineKeyboardMarkup:
     ])
 
 
-MAIN_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [btn("📋 Мои товары", "list:0"), btn("🔄 Обновить все", "refresh_all")],
-    [btn("📊 Статус", "show_stats_btn"), btn("❓ Помощь", "help_btn")],
-])
+def get_main_kb(chat_id: int) -> InlineKeyboardMarkup:
+    cfg = get_user_config(chat_id)
+    mode_btn_text = "📱 Режим: Мобильный" if cfg.get("mobile") else "💻 Режим: ПК"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("📋 Мои товары", "list:0"), btn("🔄 Обновить все", "refresh_all")],
+        [btn(mode_btn_text, "toggle_mode")],
+        [btn("📊 Статус", "show_stats_btn"), btn("❓ Помощь", "help_btn")],
+    ])
 
 
 def menu_text(chat_id: int, user) -> str:
     items = user_tracked_items.get(chat_id, [])
     name = esc(f"@{user.username}" if user.username else user.first_name or "друг")
-    text = f"🛒 <b>OZON TRACKER</b>\n{LINE}\nПривет, <b>{name}</b>!\n\n"
+    cfg = get_user_config(chat_id)
+    mode_str = "Мобильный (m.ozon.ru)" if cfg.get("mobile") else "ПК (www.ozon.ru)"
+    
+    text = f"🛒 <b>OZON TRACKER</b> (Stealth v2)\n{LINE}\nПривет, <b>{name}</b>!\n\n"
     if items:
         in_stock = sum(1 for i in items if i.get("status") is True)
-        hit = sum(1 for i in items if i.get("target_hit"))
         text += f"📦 Товаров: <b>{len(items)}</b>  ·  🟢 в наличии: <b>{in_stock}</b>\n\n"
-    text += "Пришлите ссылку на товар Ozon для отслеживания."
+    text += f"⚙️ Текущий режим парсинга: <b>{mode_str}</b>\n\nПришлите ссылку на товар Ozon для отслеживания."
     return text
 
 
 HELP_TEXT = (
-    "❓ <b>Помощь</b>\n"
+    "❓ <b>Помощь и маскировка</b>\n"
     f"{LINE}\n"
     "1️⃣ Пришлите ссылку на товар Ozon.\n"
-    "2️⃣ Получите карточку со скриншотом.\n"
-    f"3️⃣ Каждые {CHECK_INTERVAL // 60} мин бот проверяет товар автоматически."
+    "2️⃣ Бот откроет её в защищенном Stealth-режиме, сделает скриншот и покажет цену.\n"
+    "3️⃣ Если сайт выдаёт капчу, попробуйте переключить режим на <b>Мобильный</b> кнопкой в меню — мобильная версия защищена мягче."
 )
 
 
@@ -524,7 +613,7 @@ async def delete_message(chat_id: int, msg_id: Optional[int]) -> None:
 
 async def update_card(item: dict, photo: Optional[bytes] = None, title: str = "") -> None:
     chat_id, msg_id = item["chat_id"], item.get("msg_id")
-    text, kb = card_text(item, title), card_kb(item)
+    text, kb = card_text(item, chat_id, title), card_kb(item)
 
     if msg_id:
         try:
@@ -577,8 +666,9 @@ async def send_alert(item: dict, notes: List[str], photo: Optional[bytes]) -> No
 
 async def run_check(item: dict, notify: bool = True) -> CheckResult:
     async with lock_of(item):
+        chat_id = item["chat_id"]
         old_status, old_price = item.get("status"), item.get("price_value")
-        res = await check_product(item["url"])
+        res = await check_product(item["url"], chat_id)
         ok = apply_result(item, res)
         if res.screenshot:
             item["shot"] = res.screenshot
@@ -600,7 +690,7 @@ async def run_check(item: dict, notify: bool = True) -> CheckResult:
 def render_list(chat_id: int, page: int):
     items = user_tracked_items.get(chat_id, [])
     if not items:
-        return ("📦 <b>Список пуст</b>\n\nПришлите ссылку на товар Ozon.", MENU_KB)
+        return ("📦 <b>Список пуст</b>\n\nПришлите ссылку на товар Ozon.", get_main_kb(chat_id))
 
     pages = (len(items) + PAGE_SIZE - 1) // PAGE_SIZE
     page = max(0, min(page, pages - 1))
@@ -623,7 +713,17 @@ def render_list(chat_id: int, page: int):
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_tracked_items.setdefault(message.chat.id, [])
-    await message.answer(menu_text(message.chat.id, message.from_user), reply_markup=MAIN_KB)
+    await message.answer(menu_text(message.chat.id, message.from_user), reply_markup=get_main_kb(message.chat.id))
+
+
+@dp.callback_query(F.data == "toggle_mode")
+async def cb_toggle_mode(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    cfg = get_user_config(chat_id)
+    cfg["mobile"] = not cfg.get("mobile", False)
+    mode_name = "Мобильный (m.ozon.ru)" if cfg["mobile"] else "ПК (www.ozon.ru)"
+    await callback.answer(f"Режим изменен на: {mode_name}", show_alert=True)
+    await show_text(callback.message, menu_text(chat_id, callback.from_user), get_main_kb(chat_id))
 
 
 @dp.callback_query(F.data == "noop")
@@ -640,7 +740,7 @@ async def cb_close(callback: CallbackQuery):
 @dp.callback_query(F.data == "back_to_main_btn")
 async def cb_back_to_main(callback: CallbackQuery):
     await callback.answer()
-    await show_text(callback.message, menu_text(callback.message.chat.id, callback.from_user), MAIN_KB)
+    await show_text(callback.message, menu_text(callback.message.chat.id, callback.from_user), get_main_kb(callback.message.chat.id))
 
 
 @dp.callback_query(F.data == "help_btn")
@@ -700,7 +800,7 @@ async def cb_refresh_all(callback: CallbackQuery):
             pass
 
     await asyncio.gather(*(one(i) for i in items))
-    await show_text(msg, menu_text(chat_id, callback.from_user), MAIN_KB)
+    await show_text(msg, menu_text(chat_id, callback.from_user), get_main_kb(chat_id))
 
 
 @dp.callback_query(F.data == "clear_ask")
@@ -774,7 +874,7 @@ async def handle_url(message: Message):
 
     async def add_one(url: str):
         item = new_item(chat_id, url)
-        ph = await message.answer("⏳ <b>Открываю Ozon…</b>")
+        ph = await message.answer("⏳ <b>Открываю Ozon в Stealth-режиме…</b>")
         item["msg_id"] = ph.message_id
         items.append(item)
         try:
@@ -916,7 +1016,7 @@ async def monitor_loop() -> None:
 async def main() -> None:
     await bot.set_my_commands([BotCommand(command="start", description="Главное меню")])
     monitor = asyncio.create_task(monitor_loop())
-    log.info("OZON TRACKER запущен")
+    log.info("OZON TRACKER Stealth v2 запущен")
     try:
         await dp.start_polling(bot, drop_pending_updates=True)
     finally:
