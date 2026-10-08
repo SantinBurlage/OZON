@@ -1,335 +1,929 @@
-import os
-import sys
+"""
+OZON TRACKER v4 (app.py)
+"""
 import asyncio
 import datetime
-import logging
-import re
 import html
-import time
 import json
+import logging
+import os
+import random
+import re
+import sys
+import time
+import uuid
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
-
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
+    BotCommand,
     BufferedInputFile,
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
     CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Message,
 )
-from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("Europe/Moscow")
+except Exception:
+    TZ = None
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
+log = logging.getLogger("ozon")
+
+# ═════════════════════════ Конфиг ═════════════════════════
 BOT_TOKEN = "8930660922:AAG-e6Kn4hGA5UWLLmyk9ttLszuxcRvF0sk"
-DB_FILE = "database.json"
+PROXY_HOST = "45.81.78.52"
+PROXY_PORT = "8000"
+PROXY_USER = "8BNMZ4"
+PROXY_PASS = "auBcMS"
+ALLOWED_USERS = {int(x) for x in re.findall(r"\d+", os.getenv("ALLOWED_USERS", ""))}
 
-PROXY_IP = "45.81.78.52"             
-PROXY_PORT = "8000"           
-PROXY_USER = "8BNMZ4"           
-PROXY_PASS = "auBcMS"           
-PROXY_URL = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_IP}:{PROXY_PORT}"
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
+MAX_ITEMS_PER_USER = 30
+MAX_PARALLEL_CHECKS = 2
+PAGE_SIZE = 6
+HISTORY_LIMIT = 200
+PAGE_TIMEOUT_MS = 25_000
+PARSE_WAIT_SEC = 20
+HARD_TIMEOUT_SEC = 80
+ALERT_AFTER_FAILS = 6
 
-bot = Bot(token=BOT_TOKEN)
+if not BOT_TOKEN:
+    sys.exit("Задайте BOT_TOKEN")
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 START_TIME = time.time()
-TOTAL_CHECKS_COUNT = 0
+TOTAL_CHECKS = 0
 user_tracked_items: Dict[int, List[dict]] = {}
-monitoring_tasks: Dict[int, asyncio.Task] = {}
+pending_target: Dict[int, Tuple[str, int]] = {}
+item_locks: Dict[str, asyncio.Lock] = {}
+check_sem = asyncio.Semaphore(MAX_PARALLEL_CHECKS)
 
-def load_db():
-    global user_tracked_items
-    if os.path.exists(DB_FILE):
+URL_RE = re.compile(r"https?://(?:[\w-]+\.)?ozon\.ru/[^\s]+", re.IGNORECASE)
+BARS = "▁▂▃▄▅▆▇█"
+LINE = "━━━━━━━━━━━━━━"
+
+
+def esc(s) -> str:
+    return html.escape(str(s))
+
+
+def money(v: Optional[float]) -> str:
+    if v is None:
+        return "—"
+    return f"{int(round(v)):,}".replace(",", "\u00a0") + "\u00a0₽"
+
+
+def to_num(value) -> Optional[float]:
+    try:
+        return float(str(value).replace("\u00a0", "").replace(" ", "").replace(",", "."))
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_money_input(text: str) -> Optional[float]:
+    return to_num(re.sub(r"[^\d.,]", "", text))
+
+
+def now_str() -> str:
+    return datetime.datetime.now(TZ).strftime("%d.%m %H:%M")
+
+
+def fmt_ts(ts: float) -> str:
+    return datetime.datetime.fromtimestamp(ts, TZ).strftime("%d.%m %H:%M")
+
+
+def sparkline(values: List[float], width: int = 24) -> str:
+    if len(values) < 2:
+        return ""
+    if len(values) > width:
+        step = len(values) / width
+        values = [values[int(i * step)] for i in range(width)]
+    lo, hi = min(values), max(values)
+    if hi == lo:
+        return BARS[3] * len(values)
+    return "".join(BARS[int((v - lo) / (hi - lo) * (len(BARS) - 1))] for v in values)
+
+
+def btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def photo_file(data: bytes) -> BufferedInputFile:
+    return BufferedInputFile(data, filename="screen.jpg")
+
+
+def normalize_url(raw: str) -> str:
+    url = raw.rstrip(".,;)>»")
+    return url.split("?")[0].split("#")[0]
+
+
+CLOSE_KB = InlineKeyboardMarkup(inline_keyboard=[[btn("✖️ Закрыть", "close")]])
+MENU_KB = InlineKeyboardMarkup(inline_keyboard=[[btn("◀️ В меню", "back_to_main_btn")]])
+
+
+def new_item(chat_id: int, url: str) -> dict:
+    return {
+        "id": uuid.uuid4().hex[:8], "chat_id": chat_id, "url": url, "name": "Товар Ozon",
+        "price_value": None, "status": None, "image": None, "checked": None,
+        "fails": 0, "fail_notified": False, "target": None, "target_hit": False,
+        "notify_drop": True, "notify_stock": True, "history": [],
+        "msg_id": None, "has_photo": False, "shot": None,
+    }
+
+
+def find_item(chat_id: int, item_id: str) -> Optional[dict]:
+    return next((it for it in user_tracked_items.get(chat_id, []) if it["id"] == item_id), None)
+
+
+def lock_of(item: dict) -> asyncio.Lock:
+    return item_locks.setdefault(item["id"], asyncio.Lock())
+
+
+async def access_guard(handler, event, data):
+    user = data.get("event_from_user")
+    if ALLOWED_USERS and (user is None or user.id not in ALLOWED_USERS):
+        return None
+    return await handler(event, data)
+
+
+dp.update.outer_middleware(access_guard)
+
+
+class BrowserPool:
+    def __init__(self) -> None:
+        self._pw: Optional[Playwright] = None
+        self._browser: Optional[Browser] = None
+        self._context: Optional[BrowserContext] = None
+        self._fails = 0
+        self._lock = asyncio.Lock()
+
+    async def _ensure_browser(self) -> Browser:
+        if self._browser and self._browser.is_connected():
+            return self._browser
+        self._context = None
+        if self._pw is None:
+            self._pw = await async_playwright().start()
+        proxy = None
+        if PROXY_HOST:
+            proxy = {"server": f"http://{PROXY_HOST}:{PROXY_PORT}"}
+            if PROXY_USER:
+                proxy["username"] = PROXY_USER
+                proxy["password"] = PROXY_PASS
+        self._browser = await self._pw.chromium.launch(
+            headless=True, proxy=proxy,
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled"],
+        )
+        return self._browser
+
+    async def new_page(self) -> Page:
+        async with self._lock:
+            browser = await self._ensure_browser()
+            if self._context is None:
+                self._context = await browser.new_context(
+                    viewport={"width": 1280, "height": 960},
+                    user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+                    locale="ru-RU",
+                    timezone_id="Europe/Moscow",
+                )
+                await self._context.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            return await self._context.new_page()
+
+    async def report(self, ok: bool) -> None:
+        if ok:
+            self._fails = 0
+            return
+        self._fails += 1
+        if self._fails >= 3:
+            self._fails = 0
+            async with self._lock:
+                ctx, self._context = self._context, None
+            if ctx:
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+            log.info("Контекст браузера пересоздан")
+
+    async def close(self) -> None:
         try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                user_tracked_items = {int(k): v for k, v in json.load(f).items()}
+            if self._browser:
+                await self._browser.close()
+            if self._pw:
+                await self._pw.stop()
         except Exception:
             pass
 
-def save_db():
+
+pool = BrowserPool()
+
+
+@dataclass
+class CheckResult:
+    ok: bool
+    name: str = ""
+    price_value: Optional[float] = None
+    available: Optional[bool] = None
+    image: Optional[str] = None
+    error: str = ""
+    screenshot: Optional[bytes] = None
+
+
+LD_RE = re.compile(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', re.S | re.I)
+
+
+def _find_product(node) -> Optional[dict]:
+    if isinstance(node, list):
+        for n in node:
+            r = _find_product(n)
+            if r:
+                return r
+    elif isinstance(node, dict):
+        t = node.get("@type")
+        if t == "Product" or (isinstance(t, list) and "Product" in t):
+            return node
+        if "@graph" in node:
+            return _find_product(node["@graph"])
+    return None
+
+
+def parse_page(content: str) -> Optional[CheckResult]:
+    name = ""
+    price: Optional[float] = None
+    image = None
+    available: Optional[bool] = None
+
+    for raw in LD_RE.findall(content):
+        try:
+            product = _find_product(json.loads(raw))
+        except Exception:
+            continue
+        if not product:
+            continue
+        name = str(product.get("name") or "")
+        img = product.get("image")
+        image = img[0] if isinstance(img, list) and img else (img if isinstance(img, str) else None)
+        offers = product.get("offers")
+        if isinstance(offers, list) and offers:
+            offers = offers[0]
+        if isinstance(offers, dict):
+            price = to_num(offers.get("price") or offers.get("lowPrice"))
+            av = str(offers.get("availability") or "")
+            if av:
+                available = "InStock" in av
+        break
+
+    if not name:
+        m = re.search(r"<h1[^>]*>(.*?)</h1>", content, re.S | re.I)
+        if m:
+            name = html.unescape(re.sub(r"<[^>]+>", "", m.group(1))).strip()
+    if not name:
+        m = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', content)
+        if m:
+            name = html.unescape(m.group(1)).strip()
+    if not name:
+        return None
+
+    name = re.sub(r"\s*купить в интернет-магазине Ozon.*", "", name, flags=re.I).strip()
+
+    if not image:
+        m = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', content)
+        image = m.group(1) if m else None
+
+    if price is None:
+        m = re.search(r"(\d[\d\u00a0\u2009 ]{0,10}\d)\s*₽", html.unescape(content))
+        if m:
+            price = to_num(re.sub(r"\D", "", m.group(1)))
+
+    if available is None:
+        gone = re.search(r"товар закончился|узнать о поступлении|нет в наличии|распродан", content, re.I)
+        available = not gone
+
+    return CheckResult(ok=True, name=name, price_value=price, available=available, image=image)
+
+
+async def _grab(page: Page, settle: bool) -> Optional[bytes]:
     try:
-        with open(DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(user_tracked_items, f, ensure_ascii=False, indent=4)
+        if settle:
+            try:
+                await page.wait_for_load_state("load", timeout=6000)
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        return await page.screenshot(type="jpeg", quality=72, timeout=10_000)
+    except Exception:
+        return None
+
+
+async def _fetch(url: str) -> CheckResult:
+    page = await pool.new_page()
+    goto_error = ""
+    try:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        except Exception as exc:
+            goto_error = str(exc).splitlines()[0][:80]
+
+        deadline = time.monotonic() + PARSE_WAIT_SEC
+        while time.monotonic() < deadline:
+            try:
+                result = parse_page(await page.content())
+                if result:
+                    result.screenshot = await _grab(page, settle=True)
+                    return result
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+        return CheckResult(ok=False, error=goto_error or "Ozon не отдал страницу товара",
+                           screenshot=await _grab(page, settle=False))
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
+async def check_product(url: str) -> CheckResult:
+    global TOTAL_CHECKS
+    async with check_sem:
+        TOTAL_CHECKS += 1
+        try:
+            res = await asyncio.wait_for(_fetch(url), HARD_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            res = CheckResult(ok=False, error="таймаут")
+        except Exception as exc:
+            res = CheckResult(ok=False, error=str(exc).splitlines()[0][:80])
+    await pool.report(res.ok)
+    return res
+
+
+def apply_result(item: dict, res: CheckResult) -> bool:
+    if not res.ok:
+        item["fails"] += 1
+        return False
+    item.update(name=res.name, status=res.available, image=res.image or item.get("image"),
+                checked=now_str(), fails=0, fail_notified=False)
+    if res.price_value is not None:
+        item["price_value"] = res.price_value
+        hist = item["history"]
+        if not hist or hist[-1][1] != res.price_value:
+            hist.append([int(time.time()), res.price_value])
+            del hist[:-HISTORY_LIMIT]
+    return True
+
+
+def build_notes(item: dict, old_status: Optional[bool], old_price: Optional[float]) -> List[str]:
+    notes = []
+    st = item.get("status")
+    if item.get("notify_stock"):
+        if old_status is False and st is True:
+            notes.append("🟢 <b>Появился в наличии!</b>")
+        elif old_status is True and st is False:
+            notes.append("🔴 <b>Закончился</b>")
+
+    pv = item.get("price_value")
+    if pv is not None and old_price and pv < old_price and item.get("notify_drop"):
+        pct = (pv - old_price) / old_price * 100
+        notes.append(f"📉 <b>Цена снизилась:</b> <s>{money(old_price)}</s> → <b>{money(pv)}</b> ({pct:+.1f}%)")
+
+    target = item.get("target")
+    if target and pv is not None:
+        if pv <= target and not item.get("target_hit"):
+            item["target_hit"] = True
+            notes.append(f"🎯 <b>Цена достигла цели!</b> {money(pv)} ≤ {money(target)}")
+        elif pv > target:
+            item["target_hit"] = False
+    return notes
+
+
+def status_icon(st: Optional[bool]) -> str:
+    return {True: "🟢", False: "🔴"}.get(st, "⚪")
+
+
+def status_label(st: Optional[bool]) -> str:
+    return {True: "В наличии", False: "Нет в наличии"}.get(st, "Неизвестно")
+
+
+def card_text(item: dict, title: str = "") -> str:
+    pv = item.get("price_value")
+    hist = [h[1] for h in item["history"]]
+    lines = []
+    if title:
+        lines += [title, LINE]
+    lines.append(f"{status_icon(item.get('status'))} <b>{esc(item['name'][:120])}</b>")
+    lines.append("")
+
+    price = f"💰 <b>{money(pv)}</b>"
+    if len(hist) >= 2 and pv is not None and hist[-2] and pv != hist[-2]:
+        prev = hist[-2]
+        pct = (pv - prev) / prev * 100
+        if pv < prev:
+            price += f"  <s>{money(prev)}</s>  📉 {pct:+.1f}%"
+        else:
+            price += f"  📈 {pct:+.1f}%"
+    lines.append(price)
+    lines.append(f"📦 {status_label(item.get('status'))}")
+
+    target = item.get("target")
+    if target:
+        if pv is not None and pv <= target:
+            lines.append(f"🎯 Цель {money(target)} — ✅ достигнута")
+        elif pv is not None:
+            lines.append(f"🎯 Цель {money(target)} · ещё −{money(pv - target)}")
+        else:
+            lines.append(f"🎯 Цель {money(target)}")
+
+    if len(hist) >= 2:
+        lines.append(LINE)
+        lines.append(f"📊 мин {money(min(hist))} · макс {money(max(hist))}")
+        lines.append(f"<code>{sparkline(hist)}</code>")
+
+    lines.append(LINE)
+    lines.append(f"🕒 {item.get('checked') or '—'}")
+    return "\n".join(lines)
+
+
+def card_kb(item: dict) -> InlineKeyboardMarkup:
+    iid, t = item["id"], item.get("target")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("🔄 Обновить", f"check:{iid}"), btn(f"🎯 {money(t)}" if t else "🎯 Цель", f"target:{iid}")],
+        [btn("📈 История", f"hist:{iid}"), btn("🔔 Уведомления", f"notif:{iid}")],
+        [InlineKeyboardButton(text="🔗 Ozon", url=item["url"]), btn("🗑 Удалить", f"delask:{iid}")],
+    ])
+
+
+def notif_kb(item: dict) -> InlineKeyboardMarkup:
+    iid = item["id"]
+    on = lambda v: "✅" if v else "❌"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn(f"📉 Снижение цены {on(item.get('notify_drop'))}", f"tg:{iid}:drop")],
+        [btn(f"📦 Наличие {on(item.get('notify_stock'))}", f"tg:{iid}:stock")],
+        [btn("◀️ Назад", f"card:{iid}")],
+    ])
+
+
+MAIN_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [btn("📋 Мои товары", "list:0"), btn("🔄 Обновить все", "refresh_all")],
+    [btn("📊 Статус", "show_stats_btn"), btn("❓ Помощь", "help_btn")],
+])
+
+
+def menu_text(chat_id: int, user) -> str:
+    items = user_tracked_items.get(chat_id, [])
+    name = esc(f"@{user.username}" if user.username else user.first_name or "друг")
+    text = f"🛒 <b>OZON TRACKER</b>\n{LINE}\nПривет, <b>{name}</b>!\n\n"
+    if items:
+        in_stock = sum(1 for i in items if i.get("status") is True)
+        hit = sum(1 for i in items if i.get("target_hit"))
+        text += f"📦 Товаров: <b>{len(items)}</b>  ·  🟢 в наличии: <b>{in_stock}</b>\n\n"
+    text += "Пришлите ссылку на товар Ozon для отслеживания."
+    return text
+
+
+HELP_TEXT = (
+    "❓ <b>Помощь</b>\n"
+    f"{LINE}\n"
+    "1️⃣ Пришлите ссылку на товар Ozon.\n"
+    "2️⃣ Получите карточку со скриншотом.\n"
+    f"3️⃣ Каждые {CHECK_INTERVAL // 60} мин бот проверяет товар автоматически."
+)
+
+
+async def show_text(msg: Message, text: str, kb: Optional[InlineKeyboardMarkup] = None) -> None:
+    try:
+        await msg.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest as exc:
+        if "not modified" not in str(exc):
+            raise
+
+
+async def delete_message(chat_id: int, msg_id: Optional[int]) -> None:
+    if not msg_id:
+        return
+    try:
+        await bot.delete_message(chat_id, msg_id)
     except Exception:
         pass
 
-async def get_ozon_data(url: str) -> Tuple[bool, str, str, str, Optional[bytes]]:
-    global TOTAL_CHECKS_COUNT
-    TOTAL_CHECKS_COUNT += 1
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            proxy={"server": PROXY_URL},
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
-        )
-        context = await browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            locale="ru-RU"
-        )
-        page = await context.new_page()
-        await stealth_async(page)
+async def update_card(item: dict, photo: Optional[bytes] = None, title: str = "") -> None:
+    chat_id, msg_id = item["chat_id"], item.get("msg_id")
+    text, kb = card_text(item, title), card_kb(item)
 
+    if msg_id:
         try:
-            await page.goto(url, wait_until="commit", timeout=12000)
-            await asyncio.sleep(2.0)
+            if photo and item["has_photo"]:
+                await bot.edit_message_media(
+                    chat_id=chat_id, message_id=msg_id,
+                    media=InputMediaPhoto(media=photo_file(photo), caption=text), reply_markup=kb)
+                return
+            if not photo and item["has_photo"]:
+                await bot.edit_message_caption(chat_id=chat_id, message_id=msg_id, caption=text, reply_markup=kb)
+                return
+            if not photo and not item["has_photo"]:
+                await bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+                return
+        except TelegramBadRequest as exc:
+            if "not modified" in str(exc):
+                return
+        await delete_message(chat_id, msg_id)
 
-            content = await page.content()
+    photo = photo or item.get("shot")
+    sent = None
+    try:
+        if photo:
+            sent = await bot.send_photo(chat_id, photo_file(photo), caption=text, reply_markup=kb)
+        elif item.get("image"):
+            sent = await bot.send_photo(chat_id, item["image"], caption=text, reply_markup=kb)
+    except TelegramBadRequest:
+        sent = None
+    if sent is None:
+        sent = await bot.send_message(chat_id, text, reply_markup=kb)
+    item["msg_id"], item["has_photo"] = sent.message_id, bool(sent.photo)
 
-            # Название товара
-            title_match = re.search(r"<h1[^>]*>([^<]+)</h1>", content, re.IGNORECASE)
-            if not title_match:
-                title_match = re.search(r'<meta property="og:title" content="([^"]+)"', content)
-            name = title_match.group(1).strip() if title_match else "Товар Ozon"
-            name = re.sub(r"купить в интернет-магазине Ozon.*", "", name, flags=re.IGNORECASE).strip()
 
-            # Цена товара
-            price_match = re.search(r"([\d\s ]+)\s*₽", content)
-            price = f"{price_match.group(1).strip()} ₽" if price_match else "Не определена"
-
-            # Проверка наличия
-            is_out_of_stock = bool(re.search(r"товар закончился|узнать о поступлении|нет в наличии", content, re.IGNORECASE))
-            has_buy_button = bool(re.search(r"в корзину|купить в 1 клик|>купить<", content, re.IGNORECASE))
-            is_available = has_buy_button and not is_out_of_stock
-
-            photo_bytes = None
-            try:
-                photo_bytes = await page.screenshot(type="jpeg", quality=80)
-            except:
-                pass
-
-            await browser.close()
-            return is_available, name, price, ("В наличии" if is_available else "Нет в наличии"), photo_bytes
-
-        except Exception as exc:
-            await browser.close()
-            return False, "Ошибка загрузки", "—", str(exc)[:30], None
-
-def make_product_keyboard(url: str, item_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"check_now:{item_id}"),
-            InlineKeyboardButton(text="🔗 Купить", url=url)
-        ],
-        [
-            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_item:{item_id}")
-        ]
+async def send_alert(item: dict, notes: List[str], photo: Optional[bytes]) -> None:
+    text = ("🔔 " + "\n".join(notes) + f"\n{LINE}\n<b>{esc(item['name'][:120])}</b>\n"
+            f"💰 {money(item.get('price_value'))} · 📦 {status_label(item.get('status'))}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Открыть на Ozon", url=item["url"])],
+        [btn("📌 Показать карточку", f"open:{item['id']}")],
     ])
+    chat_id = item["chat_id"]
+    try:
+        if photo:
+            await bot.send_photo(chat_id, photo_file(photo), caption=text, reply_markup=kb)
+            return
+    except TelegramBadRequest:
+        pass
+    await bot.send_message(chat_id, text, reply_markup=kb)
 
-async def monitoring_worker(chat_id: int):
-    while True:
-        try:
-            items = user_tracked_items.get(chat_id, [])
-            for item in list(items):
-                is_avail, name, price, stock, _ = await get_ozon_data(item["url"])
-                old_status = item.get("status")
-                
-                item["name"] = name
-                item["price"] = price
-                item["status"] = is_avail
-                save_db()
 
-                # Уведомление, если товар появился в наличии
-                if is_avail is True and old_status is not True:
-                    caption = f"🔥 <b>ТОВАР СНОВА В НАЛИЧИИ!</b>\n\n📦 <b>{name}</b>\n🟢 Статус: В наличии\n💰 Цена: <b>{price}</b>"
-                    await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=make_product_keyboard(item["url"], item["id"]))
+async def run_check(item: dict, notify: bool = True) -> CheckResult:
+    async with lock_of(item):
+        old_status, old_price = item.get("status"), item.get("price_value")
+        res = await check_product(item["url"])
+        ok = apply_result(item, res)
+        if res.screenshot:
+            item["shot"] = res.screenshot
 
-                await asyncio.sleep(5.0)
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            pass
-        await asyncio.sleep(600)
+        notes: List[str] = []
+        title = ""
+        if ok:
+            notes = build_notes(item, old_status, old_price)
+        else:
+            title = f"⚠️ <b>Ошибка обновления:</b> {esc(res.error)}"
+
+        await update_card(item, photo=res.screenshot, title=title)
+
+        if notify and notes:
+            await send_alert(item, notes, res.screenshot)
+        return res
+
+
+def render_list(chat_id: int, page: int):
+    items = user_tracked_items.get(chat_id, [])
+    if not items:
+        return ("📦 <b>Список пуст</b>\n\nПришлите ссылку на товар Ozon.", MENU_KB)
+
+    pages = (len(items) + PAGE_SIZE - 1) // PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    rows = []
+    for it in items[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
+        label = f"{status_icon(it.get('status'))} {it['name'][:26]} · {money(it.get('price_value'))}"
+        rows.append([btn(label, f"open:{it['id']}")])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(btn("⬅️", f"list:{page - 1}"))
+        nav.append(btn(f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(btn("➡️", f"list:{page + 1}"))
+        rows.append(nav)
+    rows.append([btn("🗑 Очистить всё", "clear_ask"), btn("◀️ В меню", "back_to_main_btn")])
+    return (f"📋 <b>Мои товары</b> ({len(items)})", InlineKeyboardMarkup(inline_keyboard=rows))
+
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    chat_id = message.chat.id
-    username = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
-    
-    if chat_id not in user_tracked_items:
-        user_tracked_items[chat_id] = []
-        save_db()
-        
-    if chat_id not in monitoring_tasks or monitoring_tasks[chat_id].done():
-        monitoring_tasks[chat_id] = asyncio.create_task(monitoring_worker(chat_id))
+    user_tracked_items.setdefault(message.chat.id, [])
+    await message.answer(menu_text(message.chat.id, message.from_user), reply_markup=MAIN_KB)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Список товаров", callback_data="show_list_btn")],
-        [InlineKeyboardButton(text="📊 Статус", callback_data="show_stats_btn")]
-    ])
 
-    await message.answer(
-        f"🔥 <b>OZON TRACKER</b>\n👋 Привет, <b>{username}</b>!\n\nОтправь ссылку на товар Ozon для отслеживания.",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
-
-@dp.message(Command("ip"))
-async def cmd_ip(message: Message):
-    wait_msg = await message.answer("🔄 Проверяю IP прокси...")
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, proxy={"server": PROXY_URL})
-            page = await browser.new_context().new_page()
-            await page.goto("https://api.ipify.org?format=json", timeout=8000)
-            ip_data = await page.inner_text("body")
-            await wait_msg.edit_text(f"🌐 IP прокси: <code>{ip_data}</code>", parse_mode="HTML")
-            await browser.close()
-    except Exception as exc:
-        await wait_msg.edit_text(f"🔴 Ошибка: {html.escape(str(exc)[:40])}", parse_mode="HTML")
-
-@dp.message(Command("list"))
-@dp.callback_query(F.data == "show_list_btn")
-async def cmd_list(event):
-    message = event.message if isinstance(event, CallbackQuery) else event
-    chat_id = message.chat.id
-    if isinstance(event, CallbackQuery):
-        await event.answer()
-
-    items = user_tracked_items.get(chat_id, [])
-    if not items:
-        text = "📦 Ваш список товаров пуст."
-        if isinstance(event, CallbackQuery):
-            await message.edit_text(text)
-        else:
-            await message.answer(text)
-        return
-
-    text = "📋 <b>Отслеживаемые товары:</b>\n\n"
-    for idx, item in enumerate(items, 1):
-        price = item.get("price", "—")
-        st = item.get("status")
-        icon = "🟢 В наличии" if st is True else "🔴 Нет в наличии"
-        text += f"{idx}. <b>{item.get('name', 'Товар')}</b>\n   Статус: {icon} | Цена: {price}\n\n"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑 Очистить список", callback_data="clear_all_btn")],
-        [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main_btn")]
-    ])
-    
-    if isinstance(event, CallbackQuery):
-        await message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    else:
-        await message.answer(text, parse_mode="HTML", reply_markup=kb)
-
-@dp.message(F.text.regexp(r"https?://(?:www\.)?ozon\.ru/\S+"))
-async def handle_url(message: Message):
-    url = re.search(r"https?://(?:www\.)?ozon\.ru/\S+", message.text).group(0)
-    chat_id = message.chat.id
-
-    if chat_id not in user_tracked_items:
-        user_tracked_items[chat_id] = []
-
-    if any(item["url"] == url for item in user_tracked_items[chat_id]):
-        await message.answer("ℹ️ Этот товар уже есть в списке.")
-        return
-
-    item_id = int(time.time() * 1000) % 1000000
-    new_item = {
-        "id": item_id, "url": url, "name": "Загрузка...",
-        "price": "—", "status": True, "stock": "—"
-    }
-    user_tracked_items[chat_id].append(new_item)
-    save_db()
-
-    if chat_id not in monitoring_tasks or monitoring_tasks[chat_id].done():
-        monitoring_tasks[chat_id] = asyncio.create_task(monitoring_worker(chat_id))
-
-    wait_msg = await message.answer("⏳ Получаю данные товара...")
-    
-    is_avail, name, price, stock, photo_bytes = await get_ozon_data(url)
-    new_item["name"] = name
-    new_item["price"] = price
-    new_item["status"] = is_avail
-    new_item["stock"] = stock
-    save_db()
-
-    status_str = "🟢 В наличии" if is_avail else "🔴 Нет в наличии"
-    caption = f"✅ <b>Товар добавлен</b>\n\n📦 <b>{name}</b>\nСтатус: <b>{status_str}</b>\n💰 Цена: <b>{price}</b>"
-    kb = make_product_keyboard(url, item_id)
-    try: await wait_msg.delete()
-    except: pass
-
-    if photo_bytes:
-        await message.answer_photo(BufferedInputFile(photo_bytes, filename="ozon.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
-    else:
-        await message.answer(caption, parse_mode="HTML", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("check_now:"))
-async def callback_check_now(callback: CallbackQuery):
-    item_id = int(callback.data.split(":")[1])
-    chat_id = callback.message.chat.id
-    items = user_tracked_items.get(chat_id, [])
-    target = next((it for it in items if it["id"] == item_id), None)
-
-    if not target:
-        await callback.answer("Товар не найден", show_alert=True)
-        return
-
-    await callback.answer("Проверяю...")
-    is_avail, name, price, stock, photo_bytes = await get_ozon_data(target["url"])
-    target["name"], target["price"], target["status"], target["stock"] = name, price, is_avail, stock
-    save_db()
-
-    status_str = "🟢 В наличии" if is_avail else "🔴 Нет в наличии"
-    caption = f"🔄 <b>Обновлено:</b>\n\n📦 <b>{name}</b>\nСтатус: <b>{status_str}</b>\n💰 Цена: <b>{price}</b>"
-    kb = make_product_keyboard(target["url"], item_id)
-
-    if photo_bytes:
-        await callback.message.answer_photo(BufferedInputFile(photo_bytes, filename="ozon.jpg"), caption=caption, parse_mode="HTML", reply_markup=kb)
-    else:
-        await callback.message.answer(caption, parse_mode="HTML", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("delete_item:"))
-async def callback_delete_item(callback: CallbackQuery):
-    item_id = int(callback.data.split(":")[1])
-    chat_id = callback.message.chat.id
-    user_tracked_items[chat_id] = [it for it in user_tracked_items.get(chat_id, []) if it["id"] != item_id]
-    save_db()
-    await callback.answer("Удалено", show_alert=True)
-    try: await callback.message.delete()
-    except: pass
-
-@dp.callback_query(F.data == "show_stats_btn")
-async def callback_stats(callback: CallbackQuery):
-    uptime_str = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
-    tracked_count = len(user_tracked_items.get(callback.message.chat.id, []))
-    text = f"📊 <b>Статус системы:</b>\n\n⏱ Аптайм: {uptime_str}\n📦 Отслеживаемых товаров: {tracked_count}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main_btn")]])
+@dp.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
-@dp.callback_query(F.data == "clear_all_btn")
-async def callback_clear_all(callback: CallbackQuery):
-    user_tracked_items[callback.message.chat.id] = []
-    save_db()
-    await callback.answer("Очищено", show_alert=True)
-    await callback.message.edit_text("🗑️ Список товаров пуст.")
+
+@dp.callback_query(F.data == "close")
+async def cb_close(callback: CallbackQuery):
+    await callback.answer()
+    await delete_message(callback.message.chat.id, callback.message.message_id)
+
 
 @dp.callback_query(F.data == "back_to_main_btn")
-async def callback_back_to_main(callback: CallbackQuery):
+async def cb_back_to_main(callback: CallbackQuery):
     await callback.answer()
+    await show_text(callback.message, menu_text(callback.message.chat.id, callback.from_user), MAIN_KB)
+
+
+@dp.callback_query(F.data == "help_btn")
+async def cb_help(callback: CallbackQuery):
+    await callback.answer()
+    await show_text(callback.message, HELP_TEXT, MENU_KB)
+
+
+@dp.callback_query(F.data == "show_stats_btn")
+async def cb_stats(callback: CallbackQuery):
+    await callback.answer()
+    cid = callback.message.chat.id
+    uptime = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
+    text = f"📊 <b>Статус</b>\n{LINE}\n⏱ Аптайм: {uptime}\n📦 Товаров: {len(user_tracked_items.get(cid, []))}"
+    await show_text(callback.message, text, MENU_KB)
+
+
+@dp.callback_query(F.data.startswith("list:"))
+async def cb_list(callback: CallbackQuery):
+    await callback.answer()
+    text, kb = render_list(callback.message.chat.id, int(callback.data.split(":")[1]))
+    await show_text(callback.message, text, kb)
+
+
+@dp.callback_query(F.data.startswith("open:"))
+async def cb_open(callback: CallbackQuery):
+    item = find_item(callback.message.chat.id, callback.data.split(":")[1])
+    if not item:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    await callback.answer()
+    await delete_message(item["chat_id"], item.get("msg_id"))
+    item["msg_id"] = None
+    await update_card(item)
+
+
+@dp.callback_query(F.data == "refresh_all")
+async def cb_refresh_all(callback: CallbackQuery):
     chat_id = callback.message.chat.id
-    username = f"@{callback.from_user.username}" if callback.from_user.username else message.from_user.first_name
+    items = list(user_tracked_items.get(chat_id, []))
+    if not items:
+        await callback.answer("Список пуст", show_alert=True)
+        return
+    await callback.answer("Обновляю…")
+    msg, done = callback.message, 0
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Список товаров", callback_data="show_list_btn")],
-        [InlineKeyboardButton(text="📊 Статус", callback_data="show_stats_btn")]
-    ])
+    async def one(item: dict):
+        nonlocal done
+        try:
+            await run_check(item, notify=True)
+        except Exception:
+            pass
+        done += 1
+        try:
+            await show_text(msg, f"⏳ Обновляю: {done}/{len(items)}…")
+        except Exception:
+            pass
 
-    await callback.message.edit_text(
-        f"🔥 <b>OZON TRACKER</b>\n👋 Привет, <b>{username}</b>!\n\nОтправь ссылку на товар Ozon.",
-        parse_mode="HTML",
-        reply_markup=kb
+    await asyncio.gather(*(one(i) for i in items))
+    await show_text(msg, menu_text(chat_id, callback.from_user), MAIN_KB)
+
+
+@dp.callback_query(F.data == "clear_ask")
+async def cb_clear_ask(callback: CallbackQuery):
+    await callback.answer()
+    await show_text(callback.message, "🗑 Удалить все товары?", InlineKeyboardMarkup(
+        inline_keyboard=[[btn("✅ Да", "clear_yes"), btn("↩️ Отмена", "list:0")]]))
+
+
+@dp.callback_query(F.data == "clear_yes")
+async def cb_clear_yes(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    for it in user_tracked_items.get(chat_id, []):
+        await delete_message(chat_id, it.get("msg_id"))
+        item_locks.pop(it["id"], None)
+    user_tracked_items[chat_id] = []
+    await callback.answer("Очищено")
+    text, kb = render_list(chat_id, 0)
+    await show_text(callback.message, text, kb)
+
+
+@dp.message(F.text, lambda m: m.chat.id in pending_target and "ozon.ru" not in m.text and not m.text.startswith("/"))
+async def handle_target_input(message: Message):
+    chat_id = message.chat.id
+    item_id, prompt_id = pending_target.pop(chat_id)
+    item = find_item(chat_id, item_id)
+    if not item:
+        await message.answer("Товар не найден.")
+        return
+    value = parse_money_input(message.text)
+    if value is None:
+        pending_target[chat_id] = (item_id, prompt_id)
+        await message.answer("Введите цену числом, например <code>1500</code>")
+        return
+    if value == 0:
+        item["target"], item["target_hit"] = None, False
+        title = "🎯 Цель снята"
+    else:
+        item["target"] = value
+        pv = item.get("price_value")
+        item["target_hit"] = pv is not None and pv <= value
+        title = f"🎯 <b>Цель установлена:</b> {money(value)}"
+    await delete_message(chat_id, prompt_id)
+    await delete_message(chat_id, message.message_id)
+    await update_card(item, title=title)
+
+
+@dp.message(F.text.contains("ozon.ru"))
+async def handle_url(message: Message):
+    chat_id = message.chat.id
+    pending_target.pop(chat_id, None)
+    urls: List[str] = []
+    for m in URL_RE.finditer(message.text):
+        u = normalize_url(m.group(0))
+        if u not in urls:
+            urls.append(u)
+    if not urls:
+        await message.answer("Не вижу ссылку на Ozon")
+        return
+
+    items = user_tracked_items.setdefault(chat_id, [])
+    existing = {it["url"] for it in items}
+    fresh = [u for u in urls if u not in existing]
+    if not fresh:
+        await message.answer("ℹ️ Этот товар уже отслеживается.")
+        return
+    room = MAX_ITEMS_PER_USER - len(items)
+    if room <= 0:
+        await message.answer(f"⚠️ Лимит — {MAX_ITEMS_PER_USER} товаров.")
+        return
+
+    async def add_one(url: str):
+        item = new_item(chat_id, url)
+        ph = await message.answer("⏳ <b>Открываю Ozon…</b>")
+        item["msg_id"] = ph.message_id
+        items.append(item)
+        try:
+            await run_check(item, notify=False)
+        except Exception:
+            pass
+
+    await asyncio.gather(*(add_one(u) for u in fresh[:room]))
+
+
+@dp.callback_query(F.data.startswith("check:"))
+async def cb_check(callback: CallbackQuery):
+    item = find_item(callback.message.chat.id, callback.data.split(":")[1])
+    if not item:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    if lock_of(item).locked():
+        await callback.answer("Уже проверяю…")
+        return
+    await callback.answer("Проверяю…")
+    try:
+        await update_card(item, title="⏳ <b>Обновляю…</b>")
+    except Exception:
+        pass
+    await run_check(item, notify=True)
+
+
+@dp.callback_query(F.data.startswith("card:"))
+async def cb_card(callback: CallbackQuery):
+    item = find_item(callback.message.chat.id, callback.data.split(":")[1])
+    if not item:
+        return
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=card_kb(item))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data.startswith("notif:"))
+async def cb_notif(callback: CallbackQuery):
+    item = find_item(callback.message.chat.id, callback.data.split(":")[1])
+    if not item:
+        return
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=notif_kb(item))
+
+
+@dp.callback_query(F.data.startswith("tg:"))
+async def cb_toggle(callback: CallbackQuery):
+    _, item_id, kind = callback.data.split(":")
+    item = find_item(callback.message.chat.id, item_id)
+    if not item:
+        return
+    key = "notify_drop" if kind == "drop" else "notify_stock"
+    item[key] = not item[key]
+    await callback.answer("Готово")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=notif_kb(item))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data.startswith("target:"))
+async def cb_target(callback: CallbackQuery):
+    item = find_item(callback.message.chat.id, callback.data.split(":")[1])
+    if not item:
+        return
+    await callback.answer()
+    cur = f"\nСейчас: <b>{money(item['price_value'])}</b>" if item.get("price_value") else ""
+    prompt = await callback.message.answer(
+        f"🎯 <b>Целевая цена</b>{cur}\n\nНапишите цену числом:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn("✖️ Отмена", "tcancel")]]),
     )
+    pending_target[callback.message.chat.id] = (item["id"], prompt.message_id)
+
+
+@dp.callback_query(F.data == "tcancel")
+async def cb_tcancel(callback: CallbackQuery):
+    pending_target.pop(callback.message.chat.id, None)
+    await callback.answer("Отменено")
+    await delete_message(callback.message.chat.id, callback.message.message_id)
+
+
+@dp.callback_query(F.data.startswith("hist:"))
+async def cb_history(callback: CallbackQuery):
+    item = find_item(callback.message.chat.id, callback.data.split(":")[1])
+    if not item:
+        return
+    await callback.answer()
+    hist = item["history"]
+    if not hist:
+        text = "📈 История пока пуста."
+    else:
+        vals = [h[1] for h in hist]
+        lines = [f"📈 <b>История цены</b>\n<b>{esc(item['name'][:100])}</b>\n{LINE}"]
+        if len(vals) >= 2:
+            lines.append(f"<code>{sparkline(vals)}</code>")
+        lines.append(f"Сейчас: <b>{money(vals[-1])}</b>\nМин: {money(min(vals))} · Макс: {money(max(vals))}\n")
+        text = "\n".join(lines)
+    await callback.message.answer(text, reply_markup=CLOSE_KB)
+
+
+@dp.callback_query(F.data.startswith("delask:"))
+async def cb_delete_ask(callback: CallbackQuery):
+    item_id = callback.data.split(":")[1]
+    if not find_item(callback.message.chat.id, item_id):
+        return
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [btn("✅ Удалить", f"del:{item_id}"), btn("↩️ Отмена", f"card:{item_id}")]]))
+
+
+@dp.callback_query(F.data.startswith("del:"))
+async def cb_delete(callback: CallbackQuery):
+    item_id = callback.data.split(":")[1]
+    chat_id = callback.message.chat.id
+    user_tracked_items[chat_id] = [it for it in user_tracked_items.get(chat_id, []) if it["id"] != item_id]
+    item_locks.pop(item_id, None)
+    await callback.answer("Удалено")
+    await delete_message(chat_id, callback.message.message_id)
+
+
+async def monitor_loop() -> None:
+    await asyncio.sleep(20)
+    while True:
+        snapshot = [it for items in list(user_tracked_items.values()) for it in list(items)]
+        for item in snapshot:
+            await asyncio.sleep(random.uniform(0, 4))
+            if item not in user_tracked_items.get(item["chat_id"], []) or lock_of(item).locked():
+                continue
+            try:
+                await run_check(item, notify=True)
+            except Exception:
+                pass
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+async def main() -> None:
+    await bot.set_my_commands([BotCommand(command="start", description="Главное меню")])
+    monitor = asyncio.create_task(monitor_loop())
+    log.info("OZON TRACKER запущен")
+    try:
+        await dp.start_polling(bot, drop_pending_updates=True)
+    finally:
+        monitor.cancel()
+        await pool.close()
+        await bot.session.close()
+
 
 if __name__ == "__main__":
-    async def main():
-        load_db()
-        print("OZON TRACKER запущен!")
-        await dp.start_polling(bot, drop_pending_updates=True)
     asyncio.run(main())
